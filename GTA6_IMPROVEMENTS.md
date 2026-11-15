@@ -1,22 +1,23 @@
 # GTA 6 YouTube Automation Improvements
 
-## Core Safety Rules (Implemented / To Enforce)
+## Status (as of 16 Nov 2026)
+- Branch `gta6-improvements` created.
+- Private upload guard utility added: `utils/gta6-private-upload-guard.js`
+- Local clips provider example added: `utils/local-clips-provider.example.js`
+- Example config added: `config/gta6-local-clips.example.json`
+
+## Core Safety Rules
 - All uploads default to **private**. Human must manually switch to public or set publishAt.
 - Never auto-publish without explicit approval gate.
 - Local gameplay clips preferred over stock/AI footage for originality.
 - Compliance checklist must pass before any upload.
 
-## Recommended Changes
-1. Force `privacyStatus: 'private'` in `uploadToYouTube` regardless of schedule (override only via explicit flag after approval).
-2. Add LocalClipsProvider that reads from a `/gta6-clips` folder with a manifest.json.
-3. Integrate the 15-point pre-publish checklist from Compliance bot.
-4. Add GTA 6 specific prompt templates for Script & Strategy agents.
-5. Disable stock video providers by default.
-
-## Next Implementation Steps
-- Update publishing agent to hard-enforce private uploads.
-- Create local clips provider.
-- Add compliance gate hook.
-- Test with a synthetic private upload (no GTA footage).
+## Next Steps
+1. Wire the private upload guard into `agents/publishing-scheduling-agent.js`.
+2. Implement full LocalClipsProvider and point video generation at `./gta6-clips`.
+3. Add the 15-point compliance checklist as a pre-upload gate.
+4. Disable stock video providers by default.
+5. Add GTA 6 specific prompt templates.
+6. Test with a private synthetic upload once YouTube API credentials are configured.
 
 Forked from darkzOGx/youtube-automation-agent for GTA 6 channel use.
