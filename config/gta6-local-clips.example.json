@@ -1,0 +1,6 @@
+{
+  "provider": "local",
+  "clipsFolder": "./gta6-clips",
+  "manifest": "./gta6-clips/manifest.json",
+  "notes": "Place your own captured GTA 6 gameplay clips here. Each clip should have original commentary. Do not use leaked or pre-release footage."
+}
