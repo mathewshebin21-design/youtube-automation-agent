@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "channel": "CutsceneCity",
+  "twitch_channel": "cutscenecity",
+  "youtube_handle": "@cutscenecity",
+  "source_vod": "https://www.twitch.tv/videos/2936544559",
+  "mode": "review_only",
+  "candidate_limit_per_hour": 8,
+  "preferred_duration_seconds": [
+    20,
+    45
+  ],
+  "allowed_duration_seconds": [
+    15,
+    60
+  ],
+  "target_resolution": [
+    1080,
+    1920
+  ],
+  "minimum_score_for_review": 70,
+  "minimum_score_for_editorial_pass": 80,
+  "score_weights": {
+    "hook": 25,
+    "payoff": 20,
+    "standalone_clarity": 15,
+    "pacing": 15,
+    "mobile_visuals": 10,
+    "distinctiveness": 10,
+    "audio": 5
+  },
+  "required_gates": [
+    "verified_source",
+    "scene_evidence",
+    "media_decode",
+    "audio_quality",
+    "caption_accuracy",
+    "rights_review",
+    "deduplication",
+    "human_approval"
+  ],
+  "public_publish_enabled": false,
+  "paid_services_enabled": false,
+  "automatic_upload_enabled": false,
+  "analytics_review_hours": [
+    24,
+    168
+  ]
+}
