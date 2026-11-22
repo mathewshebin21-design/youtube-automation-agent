@@ -35,6 +35,10 @@ jobs:
           args=()
           if [ "$RENDER" = "true" ]; then args+=(--render); fi
           python tools/twitch-shorts/pipeline.py --url "$VOD_URL" --output output --limit 6 "${args[@]}"
+      - name: Optional AI frame assessment (never authorizes publishing)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python tools/twitch-shorts/visual_review.py --output output
       - name: Technical quality validation
         if: ${{ inputs.render }}
         run: python tools/twitch-shorts/qa.py --output output
