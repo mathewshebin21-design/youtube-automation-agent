@@ -27,12 +27,17 @@ jobs:
           python-version: '3.11'
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: pip install -r tools/twitch-shorts/requirements.txt
+      - name: Run fail-closed QA unit tests
+        run: python -m unittest discover -s tools/twitch-shorts -p "test_*.py"
       - name: Generate candidates without publishing
         shell: bash
         run: |
           args=()
           if [ "$RENDER" = "true" ]; then args+=(--render); fi
           python tools/twitch-shorts/pipeline.py --url "$VOD_URL" --output output --limit 6 "${args[@]}"
+      - name: Technical quality validation
+        if: ${{ inputs.render }}
+        run: python tools/twitch-shorts/qa.py --output output
       - uses: actions/upload-artifact@v4
         if: always()
         with:
