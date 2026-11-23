@@ -3,9 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       vod_url:
-        description: Twitch VOD URL
+        description: URL of YOUR OWN Twitch VOD (https://www.twitch.tv/videos/<id>); no default
         required: true
-        default: https://www.twitch.tv/videos/2936544559
       render:
         description: Render review candidates
         required: true

@@ -27,6 +27,7 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { ExternalShortsService, registerExternalShortsRoutes } = require('./utils/cutscenecity/external-shorts');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -383,6 +384,15 @@ class YouTubeAutomationAgent {
     if (!process.env.API_KEY) {
       this.logger.warn('API_KEY is not set; mutating API routes are unprotected');
     }
+
+    // CutsceneCity external Shorts: ingest -> pending -> human approval click -> PRIVATE upload only.
+    // These routes fail closed (503) when API_KEY is unset, unlike the legacy routes above.
+    registerExternalShortsRoutes(this.app, () => {
+      if (!this.externalShorts) {
+        this.externalShorts = new ExternalShortsService({ youtubeProvider: () => this.agents.publishing?.youtube, logger: this.logger });
+      }
+      return this.externalShorts;
+    });
     
     // Main dashboard route
     this.app.get('/', (req, res) => {
