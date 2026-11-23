@@ -12,6 +12,7 @@ from unittest import mock
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
+os.environ.setdefault("CUTSCENECITY_UPSCALE", "off")  # keep the suite fast; Upscale tests cover the 2160 default
 import compliance  # noqa: E402
 import gatelog  # noqa: E402
 import render  # noqa: E402
@@ -126,9 +127,12 @@ class Gates(unittest.TestCase):
         b = compliance.blockers(c)
         for name in ("creator_owned_source", "vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared",
                      "original_commentary", "live_reaction_preserved", "attribution", "transformation_note",
-                     "metadata_spoiler_free", "synthetic_disclosure", "technical_qa",
+                     "metadata_spoiler_free", "technical_qa",
                      "overlays_third_parties_cleared", "paid_promotion_declared"):
             self.assertIn(name, b)
+        self.assertNotIn("synthetic_disclosure", b)  # auto-answered (phase 2.3)
+        self.assertIs(c["metadata"]["containsSyntheticMedia"], False)
+        self.assertIn("no TTS", c["synthetic_disclosure_reason"])
 
     def test_good_clip_only_waits_for_humans(self):
         self.assertEqual(set(compliance.blockers(good_clip())), {"vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared", "overlays_third_parties_cleared"})
@@ -508,7 +512,7 @@ class EndToEnd(unittest.TestCase):
         upload_private.reconcile(pkg_dir, "NONE", "Shebin")
         with mock.patch.dict(os.environ, {"CUTSCENECITY_DAILY_CAP": "1"}):
             self.assertTrue(any("daily cap" in p for p in upload_private.verify_package(pkg_dir)[1]))
-        # next IST day: move today's ledger rows to yesterday so the cap of 1 frees up
+        # next IST day: move today's ledger rows to yesterday so the cap frees up
         led = gatelog.ledger_path()
         rows = [json.loads(l) for l in led.read_text().splitlines()]
         for r in rows:
@@ -544,6 +548,53 @@ class EndToEnd(unittest.TestCase):
             self.rv("export", "--packages", str(self.d / "p3"))
         self.assertTrue(pkg_dir.exists())
 
+    def test_mixed_track_path_end_to_end(self):
+        m = self.pipeline()
+        clip = m["clips"][0]
+        self.assertEqual(clip["technical_qa"]["status"], "PASS_TECHNICAL_ONLY")          # qa.py ran at --render
+        self.assertEqual(clip["compliance"]["technical_qa"]["status"], "PASS")
+        self.assertEqual(clip["metadata"]["description"],
+                         "From my Twitch stream: https://www.twitch.tv/cutscenecity \u2014 full VOD: https://www.twitch.tv/videos/1234567890")
+        self.assertEqual(clip["compliance"]["attribution"]["status"], "PASS")
+        self.assertEqual(clip["compliance"]["synthetic_disclosure"]["status"], "PASS")
+        self.assertIsInstance(clip["commentary"]["mixed_track_speech_share"], float)
+        for g in ("original_commentary", "live_reaction_preserved"):
+            self.assertEqual(clip["compliance"][g]["status"], "WARN", clip["compliance"][g])
+        self.assertNotIn("paid_promotion", clip)                                          # suggestion only
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.rv("status")
+        st = json.loads(buf.getvalue())
+        self.assertIn("title", st["missing_creative_input"])
+        self.assertIn("review.py paid --clip short_01.mp4 --value none", st["how_to_fix"]["paid_promotion_declared"])
+        self.assertIn("NOT DECLARED", st["paid_promotion"])
+        self.assertIn("mixed_track_commentary_confirmed", st["how_to_fix"])
+        details = self.d / "details.json"
+        md = dict(clip["metadata"], title="This getaway went sideways fast")
+        details.write_text(json.dumps({"metadata": md, "transformation_note": " ".join(["word"] * 30)}))
+        self.rv("set", "--file", str(details), "--by", "Shebin")
+        self.rv("precheck")
+        for check in ("vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared", "overlays_third_parties_cleared"):
+            self.rv("signoff", "--check", check, "--by", "Shebin", "--note", "watched the full clip twice, gameplay only")
+        self.rv("paid", "--value", "none", "--by", "Shebin")
+        with self.assertRaises(SystemExit):   # mixed track not yet confirmed
+            self.rv("approve", "--by", "Shebin")
+        with self.assertRaises(SystemExit):   # note too short
+            self.rv("signoff", "--check", "mixed_track_commentary_confirmed", "--by", "Shebin", "--note", "audible")
+        self.rv("signoff", "--check", "mixed_track_commentary_confirmed", "--by", "Shebin", "--note", "my live commentary is clearly audible throughout")
+        self.rv("approve", "--by", "Shebin")
+        self.rv("export", "--packages", str(self.d / "packages"))
+        pkg_dir = next((self.d / "packages").iterdir())
+        self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
+        c2 = json.loads((pkg_dir / "clip.json").read_text())
+        self.assertEqual(c2["commentary"]["commentary_source"], "mixed_track_signed")
+        self.assertEqual(c2["compliance"]["original_commentary"]["status"], "PASS")
+        c2["commentary"]["commentary_source"] = None
+        (pkg_dir / "clip.json").write_text(json.dumps(c2))
+        self.assertTrue(any("commentary_source" in p for p in upload_private.verify_package(pkg_dir)[1]))
+
     def test_live_voice_only_no_tts_no_script(self):
         pkg_dir = self.approved_package(tts=False)
         self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
@@ -572,29 +623,36 @@ class EndToEnd(unittest.TestCase):
         upload_private.upload(pkg_dir, pkg["package_sha256"][:12], youtube=yt, media_factory=lambda p: p)
         self.assertEqual(yt.bodies[0]["paidProductPlacementDetails"], {"hasPaidProductPlacement": True})
 
-    def test_env_cap_cannot_exceed_one(self):
+    def test_env_cap_cannot_exceed_two(self):
         pkg_dir = self.approved_package()  # setUp sets CUTSCENECITY_DAILY_CAP=5
         pkg = json.loads((pkg_dir / "package.json").read_text())
         gatelog.audit(status="ATTEMPT", package_sha256="x" * 64, file_sha256="y" * 64, vod_id="999", start_ms=0, end_ms=1)
+        self.assertFalse(any("daily cap" in p for p in upload_private.verify_package(pkg_dir)[1]))  # 1 of 2 used: still allowed
+        gatelog.audit(status="ATTEMPT", package_sha256="z" * 64, file_sha256="w" * 64, vod_id="998", start_ms=0, end_ms=1)
         problems = upload_private.verify_package(pkg_dir)[1]
-        self.assertTrue(any("daily cap reached: 1/1" in p for p in problems), problems)
+        self.assertTrue(any("daily cap reached: 2/2" in p for p in problems), problems)  # 3rd upload today blocked
         self.assertEqual(pkg["upload"]["paidProductPlacement"], False)
 
 
 class DailyCap(unittest.TestCase):
     def test_clamp_and_fail_closed(self):
         cap = gatelog.effective_daily_cap
-        self.assertEqual(cap("5", 1), 1)
-        self.assertEqual(cap(None, 10), 1)
-        self.assertEqual(cap("", 3), 1)
+        self.assertEqual(gatelog.HARD_DAILY_CAP, 2)
+        self.assertEqual(cap("5", 1), 2)
+        self.assertEqual(cap("2", 1), 2)
+        self.assertEqual(cap(None, 2), 2)
+        self.assertEqual(cap(None, 10), 2)
+        self.assertEqual(cap("", 3), 2)
         self.assertEqual(cap("1", None), 1)
+        self.assertEqual(cap("1", 2), 1)
         self.assertEqual(cap("0", 1), 0)
         self.assertEqual(cap("-3", 1), 0)
         self.assertEqual(cap("abc", 1), 0)
         self.assertEqual(cap("1.5", 1), 0)
         self.assertEqual(cap(None, 0), 0)
         self.assertEqual(cap(None, True), 0)
-        self.assertEqual(cap(None, None), 1)
+        self.assertEqual(cap(None, None), 2)
+        self.assertEqual(cap(None, ""), 0)
 
     def test_zero_cap_blocks_upload(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CUTSCENECITY_STATE_DIR": d}):
@@ -603,7 +661,23 @@ class DailyCap(unittest.TestCase):
             self.assertTrue(any("disabled" in p for p in gatelog.upload_blockers(pkg, -1)))
             self.assertEqual(gatelog.upload_blockers(pkg, 1), [])
             gatelog.audit(status="ATTEMPT", package_sha256="c" * 64, file_sha256="d" * 64, vod_id="2", start_ms=0, end_ms=1)
-            self.assertTrue(any("1/1" in p for p in gatelog.upload_blockers(pkg, 7)))
+            self.assertTrue(any("1/1" in p for p in gatelog.upload_blockers(pkg, 1)))
+            self.assertEqual(gatelog.upload_blockers(pkg, 2), [])        # 2nd upload today allowed
+            self.assertEqual(gatelog.upload_blockers(pkg, 7), [])        # 7 clamps to 2
+            gatelog.audit(status="ATTEMPT", package_sha256="e" * 64, file_sha256="f" * 64, vod_id="3", start_ms=0, end_ms=1)
+            self.assertTrue(any("2/2" in p for p in gatelog.upload_blockers(pkg, 7)))   # 3rd blocked
+            self.assertTrue(any("2/2" in p for p in gatelog.upload_blockers(pkg, 2)))
+
+    def test_day_boundary_is_ist(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CUTSCENECITY_STATE_DIR": d}):
+            pkg = {"package_sha256": "a" * 64, "file_sha256": "b" * 64, "source": {"vod_id": "1", "start_ms": 0, "end_ms": 10}}
+            for i in range(2):
+                gatelog.audit(status="ATTEMPT", package_sha256=str(i) * 64, file_sha256=str(i + 2) * 64, vod_id=f"9{i}", start_ms=0, end_ms=1)
+            row = json.loads(gatelog.ledger_path().read_text().splitlines()[0])
+            self.assertTrue(row["at"].endswith("+05:30"), row["at"])
+            today = row["at"][:10]
+            self.assertTrue(any("2/2" in p for p in gatelog.upload_blockers(pkg, 2, today=today)))
+            self.assertEqual(gatelog.upload_blockers(pkg, 2, today="2099-01-01"), [])   # next IST day frees up
 
 
 class PaidPromotion(unittest.TestCase):
@@ -665,10 +739,137 @@ class OverlayScan(unittest.TestCase):
         compliance.signoff(c, "overlays_third_parties_cleared", "Shebin", "chat blurred, alerts off, no guests")
 
 
+def mixed_clip(**over):
+    c = good_clip(commentary={"mic_source": None, "tts_used": False, "mixed_track_speech_share": 0.71},
+                  render={"audio_mode": "source", "mic_source": None, "music_volume": 1.0, "captions": "OFF"})
+    c.update(over)
+    return compliance.init_clip(c)
+
+
+class MixedTrack(unittest.TestCase):
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, OWNER)
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+
+    def test_owner_mixed_track_warns_until_signed(self):
+        c = mixed_clip()
+        b = compliance.blockers(c)
+        self.assertEqual(c["compliance"]["original_commentary"]["status"], "WARN")
+        self.assertEqual(c["compliance"]["live_reaction_preserved"]["status"], "WARN")
+        self.assertIn("71%", c["compliance"]["original_commentary"]["evidence"])          # hint shown
+        self.assertIn("mixed_track_commentary_confirmed", b)
+        self.assertIn("mixed_track_commentary_confirmed", compliance.required_human_checks(c))
+        with self.assertRaises(PermissionError):
+            compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "fine")       # 5+ words
+        compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
+        compliance.evaluate(c)
+        self.assertEqual(c["compliance"]["original_commentary"]["status"], "PASS")
+        self.assertEqual(c["compliance"]["live_reaction_preserved"]["status"], "PASS")
+
+    def test_hint_alone_never_passes(self):
+        c = mixed_clip(commentary={"mic_source": None, "tts_used": False, "mixed_track_speech_share": 1.0})
+        compliance.evaluate(c)
+        self.assertEqual(c["compliance"]["original_commentary"]["status"], "WARN")
+
+    def test_non_owner_stays_rejected(self):
+        meta = {"vod_id": "1234567890", "uploader": "Other", "uploader_id": "otherstreamer"}
+        c = mixed_clip()
+        c["provenance"]["source_owner"] = meta
+        compliance.evaluate(c)
+        for g in ("original_commentary", "live_reaction_preserved", "creator_owned_source"):
+            self.assertEqual(c["compliance"][g]["status"], "FAIL", g)
+        with self.assertRaises(PermissionError):
+            compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
+
+    def test_mic_stem_preferred_and_mixed_check_not_applicable(self):
+        c = good_clip()
+        compliance.evaluate(c)
+        self.assertTrue(c["compliance"]["mixed_track_commentary_confirmed"]["not_applicable"])
+        self.assertNotIn("mixed_track_commentary_confirmed", compliance.required_human_checks(c))
+        with self.assertRaises(ValueError):
+            compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
+        thin = good_clip(commentary={"mic_source": "stream:1", "speech_seconds_live": 3.0, "speech_seconds_combined": 3.0, "tts_used": False})
+        self.assertEqual(compliance.commentary_gate(thin, {})[0], "FAIL")                   # measured path stays strict
+
+    def test_lowered_mixed_track_fails(self):
+        c = mixed_clip(render={"audio_mode": "source", "mic_source": None, "music_volume": 0.5, "captions": "OFF"})
+        self.assertEqual(compliance.live_reaction_gate(c, {})[0], "FAIL")
+
+
+class AutoDefaults(unittest.TestCase):
+    def test_disclosure_auto_and_never_flipped(self):
+        c = good_clip(metadata={"title": "t", "containsSyntheticMedia": None})
+        compliance.evaluate(c)
+        self.assertIs(c["metadata"]["containsSyntheticMedia"], False)
+        t = good_clip(metadata={"title": "t", "containsSyntheticMedia": None}, ai_visuals_used=True)
+        compliance.evaluate(t)
+        self.assertIs(t["metadata"]["containsSyntheticMedia"], True)
+        self.assertIn("AI", t["synthetic_disclosure_reason"])
+        bad = good_clip(ai_visuals_used=True)          # explicit False with AI use: still FAIL
+        self.assertEqual(compliance.disclosure_gate(bad, {})[0], "FAIL")
+
+    def test_credit_line_factual(self):
+        import pipeline
+        self.assertEqual(pipeline.credit_line({"uploader_id": "cutscenecity"}, "https://www.twitch.tv/videos/1"),
+                         "From my Twitch stream: https://www.twitch.tv/cutscenecity \u2014 full VOD: https://www.twitch.tv/videos/1")
+        self.assertEqual(pipeline.credit_line({}, "https://www.twitch.tv/videos/1"), "")
+
+    def test_speech_hint_runs(self):
+        if not HAS_FFMPEG:
+            self.skipTest("ffmpeg")
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "a.wav"
+            ffmpeg("-f", "lavfi", "-i", "sine=frequency=1000:duration=4", "-af", "volume='if(lt(t,2),1,0)':eval=frame", str(f))
+            share = compliance.mixed_speech_share(f)
+        self.assertTrue(0.3 < share < 0.7, share)
+
+
+class Upscale(unittest.TestCase):
+    def test_default_is_2160_and_off_opt_out(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUTSCENECITY_UPSCALE", None)
+            self.assertEqual(render.upscale_setting(), "2160")
+        with mock.patch.dict(os.environ, {"CUTSCENECITY_UPSCALE": "off"}):
+            self.assertIsNone(render.upscale_setting())
+            self.assertEqual(render.upscale_setting("1440"), "1440")      # flag beats env
+        self.assertIsNone(render.upscale_setting("off"))
+        with self.assertRaises(ValueError):
+            render.upscale_setting("4320")
+
+    def test_command_shape(self):
+        cmd = " ".join(render.upscale_command("in.mp4", "out.mp4", 2160, 3840))
+        for part in ("scale=2160:3840:flags=lanczos", "unsharp=5:5:0.5", "-crf 18", "-pix_fmt yuv420p", "-c:a copy", "+faststart"):
+            self.assertIn(part, cmd)
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
+    def test_upscale_real_file_audio_unchanged_and_qa_accepts(self):
+        import qa
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "c.mp4"
+            ffmpeg("-f", "lavfi", "-i", "testsrc2=s=1080x1920:r=30:d=16", "-f", "lavfi", "-i", "sine=frequency=440:duration=16",
+                   "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(f))
+            amd5 = lambda p: subprocess.run(["ffmpeg", "-v", "error", "-i", str(p), "-map", "0:a", "-c", "copy", "-f", "md5", "-"],  # noqa: E731
+                                            capture_output=True, text=True).stdout
+            before = amd5(f)
+            info = render.upscale(f, "1440")
+            self.assertEqual(info["output_resolution"], "1440x2560")
+            self.assertEqual(render.video_size(f), (1440, 2560))
+            self.assertEqual(amd5(f), before)                                   # audio stream copied unchanged
+            self.assertEqual(qa.validate(f, 0, 16)["status"], "PASS_TECHNICAL_ONLY")
+            again = render.upscale(f, "1440")                                    # never re-upscale / above target
+            self.assertTrue(again["upscale"].startswith("skipped"))
+            self.assertTrue(render.upscale(f, "2160")["upscale"] == "2160")
+            self.assertEqual(render.video_size(f), (2160, 3840))
+            self.assertTrue(render.upscale(f, "1440")["upscale"].startswith("skipped"))   # source above target: skip
+
+
 class Defaults(unittest.TestCase):
     def test_policy_defaults(self):
         pol = json.loads((HERE / "editorial-policy.json").read_text())
-        self.assertEqual(pol["daily_upload_cap"], 1)
+        self.assertEqual(pol["daily_upload_cap"], 2)
         self.assertEqual(pol["default_layout"], "blur")
         self.assertEqual(pol["source_policy"], "creator_owned_only")
         self.assertNotIn("source_vod", pol)

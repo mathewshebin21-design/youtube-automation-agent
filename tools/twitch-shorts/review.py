@@ -54,11 +54,40 @@ def source_video(root):
     return next((p for p in root.glob("vod.*") if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}), None)
 
 
+FIX_COMMANDS = {
+    "metadata_spoiler_free": "write title (+ your description text above the credit line) in details.json, then: review.py set --clip {c} --file details.json --by NAME",
+    "attribution": "keep the credit line in the description (streamer + VOD URL), then: review.py set --clip {c} --file details.json --by NAME",
+    "transformation_note": "add \"transformation_note\" (25+ words, your own) to details.json, then: review.py set --clip {c} --file details.json --by NAME",
+    "paid_promotion_declared": "suggested value 'none' (NOT declared yet): review.py paid --clip {c} --value none --by NAME  (or --value present)",
+    "technical_qa": "re-render (pipeline.py --render or review.py commentary) so qa.py runs on the final file",
+    "original_commentary": "OBS mic track: review.py commentary --clip {c} --mic-stream N ; or mixed track: review.py signoff --clip {c} --check mixed_track_commentary_confirmed --by NAME --note \"<5+ words: live commentary audible>\"",
+    "live_reaction_preserved": "same as original_commentary",
+    "mixed_track_commentary_confirmed": "review.py precheck --clip {c}; listen; review.py signoff --clip {c} --check mixed_track_commentary_confirmed --by NAME --note \"<5+ words>\"",
+    "commentary_script": "review.py script --clip {c} --file script.txt --by NAME",
+}
+
+
 def cmd_status(a, root, m, c_ctx):
     clips = [find(m, a.clip)] if a.clip else m["clips"]
     for c in clips:
         b = compliance.blockers(c, c_ctx)
-        print(json.dumps({"clip": c["file"], "blocking": b, "ready_to_approve": not b}, indent=2))
+        todo = {}
+        for name in b:
+            spec = compliance.CHECKS.get(name, {})
+            if name in FIX_COMMANDS:
+                todo[name] = FIX_COMMANDS[name].format(c=c["file"])
+            elif spec.get("kind") == "human":
+                todo[name] = f"review.py signoff --clip {c['file']} --check {name} --by NAME --note \"...\""
+        md = c.get("metadata") or {}
+        missing = [k for k, ok in (("title", md.get("title")), ("transformation_note (25+ words)", len(str(c.get("transformation_note", "")).split()) >= 25))
+                   if not ok]
+        print(json.dumps({"clip": c["file"], "blocking": b, "ready_to_approve": not b, "missing_creative_input": missing,
+                          "commentary_source": (c.get("commentary") or {}).get("commentary_source"),
+                          "paid_promotion": (c.get("paid_promotion") or {}).get("value") or
+                          f"NOT DECLARED (suggestion: {c.get('paid_promotion_suggestion', 'none')})",
+                          "synthetic_disclosure": {"containsSyntheticMedia": md.get("containsSyntheticMedia"),
+                                                   "reason": c.get("synthetic_disclosure_reason")},
+                          "how_to_fix": todo}, indent=2))
 
 
 def cmd_set(a, root, m, c_ctx):
@@ -81,6 +110,8 @@ def cmd_precheck(a, root, m, c_ctx):
     c["cutscene_scan"] = {"letterbox_ratio": compliance.letterbox_ratio(src, c["start"], c["end"]) if src else None,
                           "method": "letterbox heuristic; human sign-off still required"}
     c["fingerprint_precheck"] = compliance.fingerprint(root / c["file"])
+    if compliance.is_mixed_track(c):
+        c.setdefault("commentary", {})["mixed_track_speech_share"] = compliance.mixed_speech_share(root / c["file"])
     import overlay_scan
     c["overlay_scan"] = overlay_scan.scan(root / c["file"], gatelog.sha256_file(root / c["file"]))
     compliance.evaluate(c, c_ctx)
@@ -160,13 +191,14 @@ def cmd_commentary(a, root, m, c_ctx):
                                 game_volume=render.music_volume(a.music_volume), commentary=str(voice) if voice else None,
                                 mic=a.mic, mic_stream=a.mic_stream, blur_regions=prev.get("blur_regions") or [],
                                 caption_style=styles.get(a.caption_style) if a.captions else None,
-                                caption_style_name=a.caption_style if a.captions else None)
+                                caption_style_name=a.caption_style if a.captions else None, upscale=a.upscale)
     c["render"]["facecam"] = prev.get("facecam")
     c["render"]["profile"] = prev.get("profile")
     c["commentary"] = {"path": str(voice) if voice else None, "mic_source": c["render"]["mic_source"],
                        "speech_seconds_live": round(live, 2), "speech_seconds_combined": round(combined, 2),
                        "vad": "ffmpeg silencedetect energy VAD (-35 dB, 0.4 s) on the commentary bus",
                        "tts_used": bool(a.tts), "voice_preset": a.voice_preset if a.tts else None,
+                       "commentary_source": "mic_stem",
                        "sha256": gatelog.sha256_file(voice) if voice else None}
     if a.tts:
         c.setdefault("metadata", {})["containsSyntheticMedia"] = True  # (e) forced, not optional
@@ -210,7 +242,7 @@ def unsigned_human_checks(c, entries, file_sha):
     """Human PASS entries in the manifest must be backed by a signed sign-off for the current file."""
     signed = {e["check"] for e in entries if e.get("action") == "signoff" and e.get("clip") == c["file"]
               and e.get("file_sha256") == file_sha}
-    out = [n for n, s in compliance.CHECKS.items() if s["kind"] == "human" and n not in signed]
+    out = [n for n in compliance.required_human_checks(c) if n not in signed]
     paid = (c.get("paid_promotion") or {}).get("value")
     if not any(e.get("action") == "paid_promotion" and e.get("clip") == c["file"] and e.get("value") == paid
                and e.get("file_sha256") == file_sha for e in entries):
@@ -230,7 +262,12 @@ def cmd_signoff(a, root, m, c_ctx):
     c = find(m, a.clip)
     if a.check == "overlays_third_parties_cleared" and (c.get("overlay_scan") or {}).get("file_sha256") != gatelog.sha256_file(root / c["file"]):
         raise SystemExit("overlay scan is missing or for an older render: run review.py precheck first")
+    if a.check == "mixed_track_commentary_confirmed" and len((a.note or "").split()) < 5:
+        raise SystemExit("mixed_track_commentary_confirmed needs --note with 5+ words saying the live commentary is audible")
     entry = compliance.signoff(c, a.check, a.by or "", a.note or "", c_ctx)
+    if a.check == "mixed_track_commentary_confirmed":
+        c.setdefault("commentary", {})["commentary_source"] = "mixed_track_signed"
+        compliance.evaluate(c, c_ctx)
     gatelog.append_review(root / "review_log.jsonl", action="signoff", check=a.check, by=entry["by"], note=entry["note"],
                           clip=c["file"], file_sha256=gatelog.sha256_file(root / c["file"]))
 
@@ -325,6 +362,7 @@ def main(argv=None):
     p.add_argument("--tts", action="store_true")
     p.add_argument("--music-volume", type=float, default=None,
                    help="game/music bed level 0<v<=1 (default env CUTSCENECITY_MUSIC_VOLUME or 1.0 = original audio unchanged)")
+    p.add_argument("--upscale", default=None, help="commentary re-render: 2160 (default) | 1440 | off; env CUTSCENECITY_UPSCALE")
     p.add_argument("--strip-game-audio", action="store_true", help="opt-in: drop ALL game/music audio (mic + voiceover only)")
     p.add_argument("--captions", action="store_true")
     p.add_argument("--check")

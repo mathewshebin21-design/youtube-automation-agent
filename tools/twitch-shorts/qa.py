@@ -19,7 +19,7 @@ def validate(path, expected_start=None, expected_end=None):
         audio=next((s for s in streams if s.get("codec_type")=="audio"),None)
         duration=float(info.get("format",{}).get("duration") or 0)
         if not video: failures.append("no_video")
-        elif (video.get("width"),video.get("height"))!=(1080,1920): failures.append("wrong_resolution")
+        elif (video.get("width"),video.get("height")) not in ((1080,1920),(1440,2560),(2160,3840)): failures.append("wrong_resolution")
         if not audio: failures.append("no_audio_manual_review_required")
         if duration<15 or duration>60: failures.append("duration_out_of_range")
         if expected_start is not None and expected_end is not None and abs(duration-(expected_end-expected_start))>2: failures.append("duration_mismatch")

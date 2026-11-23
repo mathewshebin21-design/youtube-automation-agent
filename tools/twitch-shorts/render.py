@@ -212,6 +212,60 @@ def has_audio(video):
     return p.returncode == 0 and bool(json.loads(p.stdout or "{}").get("streams"))
 
 
+# ---------- upscale (ON by default: 2160x3840) ----------
+UPSCALE_ENV = "CUTSCENECITY_UPSCALE"
+UPSCALE_TARGETS = {"1440": (1440, 2560), "2160": (2160, 3840)}
+DEFAULT_UPSCALE = "2160"
+
+
+def upscale_setting(value=None):
+    """'1440' | '2160' | None (off). Default 2160; 'off' (flag or env) is an opt-out for tests/debugging."""
+    raw = str(value if value not in (None, "") else os.getenv(UPSCALE_ENV, DEFAULT_UPSCALE)).strip().lower()
+    if raw in ("off", "0", "none", "false", "no"):
+        return None
+    if raw not in UPSCALE_TARGETS:
+        raise ValueError("upscale must be 1440, 2160 or off")
+    return raw
+
+
+def video_size(path):
+    p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                        "-of", "json", str(path)], capture_output=True, text=True, check=True)
+    s = json.loads(p.stdout)["streams"][0]
+    return int(s["width"]), int(s["height"])
+
+
+def upscale_command(src, dst, width, height):
+    """Lanczos + mild unsharp; CRF 18 yuv420p +faststart; audio stream copied unchanged.
+    Upscaling adds no real detail: it only lets YouTube serve its higher-bitrate (VP9/AV1 4K) encode."""
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-map", "0:v:0", "-map", "0:a?",
+            "-vf", f"scale={width}:{height}:flags=lanczos,unsharp=5:5:0.5:5:5:0.0", "-c:v", "libx264", "-preset", "medium",
+            "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(dst)]
+
+
+def upscale(path, setting):
+    """Upscale the final render in place (after captions, before qa.py). Never above the target; skip if the
+    source is already at or above it."""
+    import time
+    path = pathlib.Path(path)
+    if setting is None:
+        w, h = video_size(path)
+        return {"upscale": "off", "output_resolution": f"{w}x{h}"}
+    tw, th = UPSCALE_TARGETS[setting]
+    w, h = video_size(path)
+    if h >= th or w >= tw:
+        return {"upscale": f"skipped (source {w}x{h} already >= {tw}x{th})", "output_resolution": f"{w}x{h}"}
+    tmp = path.with_name(path.stem + ".upscale.tmp.mp4")
+    t0 = time.monotonic()
+    try:
+        subprocess.run(upscale_command(path, tmp, tw, th), check=True)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return {"upscale": setting, "output_resolution": f"{tw}x{th}", "upscale_seconds": round(time.monotonic() - t0, 1),
+            "upscale_method": "ffmpeg lanczos + unsharp 0.5, CRF 18, audio copied"}
+
+
 def render(video, start, end, out_dir, out_name, captions=False, **opts):
     out_dir = pathlib.Path(out_dir)
     video = pathlib.Path(video).resolve()
@@ -230,10 +284,12 @@ def render(video, start, end, out_dir, out_name, captions=False, **opts):
             caption_status = "BURNED_IN_NEEDS_HUMAN_CHECK"
         else:
             srt_name, caption_status = None, "SKIPPED_NO_FASTER_WHISPER_OR_NO_SPEECH"
+    up_setting = upscale_setting(opts.pop("upscale", None))   # validate before spending time on the render
     cmd_opts = {k: v for k, v in opts.items() if k != "caption_style_name"}
     args = build_command(video, start, end, out_name, srt_name=srt_name, has_source_audio=has_audio(video), **cmd_opts)
     subprocess.run(args, check=True, cwd=str(out_dir), env={**os.environ})
-    return {"layout": opts.get("layout", "blur"), "crop_x": round(float(opts.get("crop_x", 0.5)), 3),
+    up = upscale(out_dir / out_name, up_setting)
+    return {**up, "layout": opts.get("layout", "blur"), "crop_x": round(float(opts.get("crop_x", 0.5)), 3),
             "audio_mode": opts.get("audio_mode", "source"), "commentary_mixed": bool(opts.get("commentary")),
             "mic_source": (f"file:{pathlib.Path(opts['mic']).name}" if opts.get("mic") else
                            (f"stream:{opts['mic_stream']}" if opts.get("mic_stream") is not None else None)),
