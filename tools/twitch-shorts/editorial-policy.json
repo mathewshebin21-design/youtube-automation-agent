@@ -1,9 +1,8 @@
 {
-  "version": 1,
+  "version": 5,
   "channel": "CutsceneCity",
   "twitch_channel": "cutscenecity",
   "youtube_handle": "@cutscenecity",
-  "source_vod": "https://www.twitch.tv/videos/2936544559",
   "mode": "review_only",
   "candidate_limit_per_hour": 8,
   "preferred_duration_seconds": [
@@ -30,14 +29,30 @@
     "audio": 5
   },
   "required_gates": [
-    "verified_source",
-    "scene_evidence",
-    "media_decode",
+    "attribution",
     "audio_quality",
     "caption_accuracy",
-    "rights_review",
+    "creator_owned_source",
+    "daily_cap",
     "deduplication",
-    "human_approval"
+    "duplicate_check",
+    "human_approval",
+    "media_decode",
+    "metadata_spoiler_free",
+    "music_risk_cleared",
+    "no_story_cutscene",
+    "original_commentary",
+    "overlays_third_parties_cleared",
+    "paid_promotion_declared",
+    "rights_review",
+    "scene_evidence",
+    "signed_human_approval",
+    "synthetic_disclosure",
+    "technical_qa",
+    "transformation_note",
+    "upload_audit_log",
+    "verified_source",
+    "vod_rights_confirmed"
   ],
   "public_publish_enabled": false,
   "paid_services_enabled": false,
@@ -45,5 +60,85 @@
   "analytics_review_hours": [
     24,
     168
-  ]
+  ],
+  "min_commentary_coverage": 0.6,
+  "daily_upload_cap": 1,
+  "spoiler_keywords_file": "spoiler-keywords.txt",
+  "upload_privacy": "private_only",
+  "extra_human_checks": [],
+  "source_policy": "creator_owned_only",
+  "owner_twitch_login": "cutscenecity",
+  "owner_twitch_login_note": "Default owner (twitch.tv/cutscenecity; public login, not a secret). CUTSCENECITY_OWNER_TWITCH_LOGIN overrides it; if both are empty every VOD is rejected (fail closed).",
+  "default_layout": "blur",
+  "owner_env": [
+    "CUTSCENECITY_OWNER_TWITCH_LOGIN",
+    "CUTSCENECITY_OWNER_TWITCH_ID"
+  ],
+  "tts_counts_as_commentary_env": "CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY (default true)",
+  "script_similarity": {
+    "history": 30,
+    "flag_at": 0.4,
+    "reject_above": 0.5,
+    "shingle_words": 3,
+    "reuse_opener_cta": "reject"
+  },
+  "voice_presets": [
+    {
+      "name": "charon-relaxed",
+      "voice": "Charon",
+      "style": "relaxed, conversational, light Indian English accent"
+    },
+    {
+      "name": "puck-hyped",
+      "voice": "Puck",
+      "style": "excited but natural, short sentences"
+    },
+    {
+      "name": "kore-dry",
+      "voice": "Kore",
+      "style": "dry, deadpan, slightly sarcastic"
+    }
+  ],
+  "caption_styles": {
+    "bold-white": "FontName=Arial,FontSize=14,Bold=1,Outline=2,MarginV=230",
+    "yellow-pop": "FontName=Arial,FontSize=15,PrimaryColour=&H0000FFFF,Outline=3,MarginV=260",
+    "clean-lower": "FontName=Helvetica,FontSize=12,Outline=1,Shadow=1,MarginV=180"
+  },
+  "default_layout_profile": "cutscenecity-default",
+  "layout_profiles": {
+    "cutscenecity-default": {
+      "description": "Placeholder: set after Shebin's OBS layout is known",
+      "facecam_box": null,
+      "blur_regions": []
+    },
+    "facecam-right-chat-left": {
+      "description": "Example: facecam top-right, chat overlay on the left edge",
+      "facecam_box": [
+        0.72,
+        0.02,
+        0.26,
+        0.26
+      ],
+      "blur_regions": [
+        [
+          0.0,
+          0.25,
+          0.22,
+          0.6
+        ]
+      ]
+    }
+  },
+  "daily_upload_cap_note": "Hard maximum 1 in code (Python and Node): min(env or policy, 1); 0/negative/invalid blocks.",
+  "paid_promotion_values": [
+    "none",
+    "present"
+  ],
+  "overlay_scan": {
+    "detectors": [
+      "edge-density (OpenCV)",
+      "tesseract OCR if installed"
+    ],
+    "effect": "flags only; overlays_third_parties_cleared always needs a signed human sign-off, with a 5+ word note when flagged or unavailable"
+  }
 }
