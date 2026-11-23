@@ -39,6 +39,9 @@ p.add_argument("--voice", default="charon-relaxed")
 p.add_argument("--script-variant", type=int, default=0)
 p.add_argument("--script-file")
 p.add_argument("--paid", default="none", help="none | present | skip")
+p.add_argument("--upscale", default=None, help="record render.upscale/output_resolution (e.g. 2160)")
+p.add_argument("--mixed", action="store_true", help="single mixed VOD track (no mic stem): mixed-track signed path")
+p.add_argument("--mixed-note", default="my live commentary is clearly audible throughout")
 p.add_argument("--overlay-flagged", choices=["no", "yes", "unknown"], default="no")
 p.add_argument("--overlay-note", default="watched the whole clip, gameplay only")
 a = p.parse_args()
@@ -63,6 +66,11 @@ clip = {"file": "short_01.mp4", "start": a.start, "end": a.start + 20.0,
         "fingerprint_precheck": {"status": "NO_MATCH_DB", "tool": "fixture"},
         "overlay_scan": {"file_sha256": gatelog.sha256_file(out / "short_01.mp4"), "methods": ["fixture"],
                          "flagged": {"no": False, "yes": True, "unknown": None}[a.overlay_flagged], "regions": []}}
+if a.upscale:
+    clip["render"].update({"upscale": a.upscale, "output_resolution": {"2160": "2160x3840", "1440": "1440x2560"}.get(a.upscale, a.upscale)})
+if a.mixed:
+    clip["commentary"] = {"path": None, "mic_source": None, "tts_used": False, "mixed_track_speech_share": 0.7}
+    clip["render"] = {"audio_mode": "source", "mic_source": None, "music_volume": 1.0, "layout": "blur", "captions": "OFF"}
 compliance.init_clip(clip)
 (out / "manifest.json").write_text(json.dumps({"clips": [clip]}))
 base = ["--output", str(out), "--clip", "short_01.mp4"]
@@ -74,6 +82,8 @@ if a.tts:
 for check in ("vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared"):
     review.main(["signoff", *base, "--check", check, "--by", "Tester", "--note", "watched the whole clip, gameplay only"])
 review.main(["signoff", *base, "--check", "overlays_third_parties_cleared", "--by", "Tester", "--note", a.overlay_note])
+if a.mixed:
+    review.main(["signoff", *base, "--check", "mixed_track_commentary_confirmed", "--by", "Tester", "--note", a.mixed_note])
 if a.paid != "skip":
     review.main(["paid", *base, "--value", a.paid, "--by", "Tester"])
 review.main(["approve", *base, "--by", "Tester"])

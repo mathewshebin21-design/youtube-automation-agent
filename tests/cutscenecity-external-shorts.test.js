@@ -8,7 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  ExternalShortsService, registerExternalShortsRoutes, canonicalJson, validateImport, checkClipGates, loadPolicy, ownerMatch, checkScript, effectiveDailyCap, REQUIRED_HUMAN_CHECKS
+  ExternalShortsService, registerExternalShortsRoutes, canonicalJson, validateImport, checkClipGates, isMixedTrack, loadPolicy, ownerMatch, checkScript, effectiveDailyCap, REQUIRED_HUMAN_CHECKS
 } = require('../utils/cutscenecity/external-shorts');
 
 const PY = process.env.CUTSCENECITY_PYTHON || 'python3';
@@ -271,7 +271,7 @@ test('rotation: the next upload may not reuse the previous voice preset', async 
   const ia = await ctx.call('POST', '/api/gta6/external-shorts', a);
   assert.equal(ia.status, 201, JSON.stringify(ia.json));
   assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ia.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: a.packageSha256.slice(0, 12) })).status, 200);
-  ctx.service.now = () => new Date(Date.now() + 86400000); // next IST day: the cap of 1 frees up
+  ctx.service.now = () => new Date(Date.now() + 86400000); // next IST day
   const rb = await ctx.call('POST', '/api/gta6/external-shorts', b);
   assert.equal(rb.status, 422);
   assert.match(rb.json.problems.join(' '), /voice preset charon-relaxed repeats the previous upload/);
@@ -279,18 +279,23 @@ test('rotation: the next upload may not reuse the previous voice preset', async 
   assert.equal(rc.status, 201, JSON.stringify(rc.json));
 });
 
-test('daily cap is clamped to 1 and 0/invalid blocks (fail closed)', async t => {
-  for (const [env, pol, want] of [['5', 1, 1], [undefined, 10, 1], ['', 3, 1], ['0', 1, 0], ['-2', 1, 0], ['abc', 1, 0], ['1.5', 1, 0], [undefined, 0, 0], [undefined, true, 0], [undefined, undefined, 1]]) {
+test('daily cap is clamped to 2 and 0/invalid blocks (fail closed)', async t => {
+  for (const [env, pol, want] of [['5', 1, 2], ['2', 1, 2], [undefined, 2, 2], [undefined, 10, 2], ['', 3, 2], ['1', 2, 1], ['0', 1, 0], ['-2', 1, 0], ['abc', 1, 0], ['1.5', 1, 0], [undefined, 0, 0], [undefined, true, 0], [undefined, undefined, 2]]) {
     assert.equal(effectiveDailyCap(env, pol), want, `${env}/${pol}`);
   }
-  let ctx = await setup(t, { env: { CUTSCENECITY_DAILY_CAP: '5' }, packages: 2, pkgArgs: i => ['--start', String(i * 100)] });
-  const [a, b] = ctx.pkgs.map(p => p.body);
+  let ctx = await setup(t, { env: { CUTSCENECITY_DAILY_CAP: '5' }, packages: 3, pkgArgs: i => ['--start', String(i * 100)] });
+  const [a, b, c] = ctx.pkgs.map(p => p.body);
   const ia = await ctx.call('POST', '/api/gta6/external-shorts', a);
   const ib = await ctx.call('POST', '/api/gta6/external-shorts', b);
+  const ic = await ctx.call('POST', '/api/gta6/external-shorts', c);
   assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ia.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: a.packageSha256.slice(0, 12) })).status, 200);
-  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) });
+  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) })).status, 200);
+  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ic.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: c.packageSha256.slice(0, 12) });
   assert.equal(capped.status, 422);
-  assert.match(capped.json.problems.join(' '), /daily cap reached: 1\/1/);
+  assert.match(capped.json.problems.join(' '), /daily cap reached: 2\/2 upload attempts today \(IST\)/);
+  assert.equal(ctx.youtube.calls.length, 2);
+  ctx.service.now = () => new Date(Date.now() + 86400000); // next IST day: the 3rd one is allowed
+  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ic.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: c.packageSha256.slice(0, 12) })).status, 200);
   ctx = await setup(t, { env: { CUTSCENECITY_DAILY_CAP: '0' } });
   const r = await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body);
   assert.equal(r.status, 422);
@@ -335,6 +340,55 @@ test('paid promotion: explicit true for present, missing blocks, tamper blocks',
   assert.throws(() => makePackage(path.join(ctx.work, 'nopaid'), ['--paid', 'skip', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /paid_promotion/);
 });
 
+test('mixed-track path: creator-owned + signed confirmation passes; unsigned, lowered or foreign is blocked', async t => {
+  const ctx = await setup(t, { pkgArgs: ['--mixed'] });
+  const { body, dir } = ctx.pkgs[0];
+  const clip = JSON.parse(fs.readFileSync(path.join(dir, 'clip.json'), 'utf8'));
+  assert.ok(isMixedTrack(clip));
+  assert.equal(clip.commentary.commentary_source, 'mixed_track_signed');
+  const ing = await ctx.call('POST', '/api/gta6/external-shorts', body);
+  assert.equal(ing.status, 201, JSON.stringify(ing.json));
+  const { policy, spoilerTerms } = loadPolicy(path.join(__dirname, '..', 'tools', 'twitch-shorts'));
+  const opts = { env: ctx.env, policy, spoilerTerms, history: [] };
+  assert.deepEqual(checkClipGates(clip, opts), []);
+  const unsigned = { ...clip, commentary: { ...clip.commentary, commentary_source: null } };
+  assert.match(checkClipGates(unsigned, opts).join(' '), /mixed_track_commentary_confirmed/);
+  const lowered = { ...clip, render: { ...clip.render, music_volume: 0.5 } };
+  assert.match(checkClipGates(lowered, opts).join(' '), /full level/);
+  const foreign = { ...clip, provenance: { ...clip.provenance, source_owner: { ...clip.provenance.source_owner, uploader_id: 'otherstreamer' } } };
+  const fp = checkClipGates(foreign, opts).join(' ');
+  assert.match(fp, /not the owner/);
+  assert.match(fp, /only creator-owned VODs/);
+  // the human sign-off needs 5+ words and must exist in the signed log
+  assert.throws(() => makePackage(path.join(ctx.work, 'short'), ['--mixed', '--start', '200', '--mixed-note', 'audible'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  const lines = fs.readFileSync(path.join(dir, 'review_log.jsonl'), 'utf8').trim().split('\n');
+  assert.ok(lines.some(l => JSON.parse(l).check === 'mixed_track_commentary_confirmed'));
+});
+
+test('mic-stem packages do not need the mixed-track sign-off (stricter measured path preferred)', async t => {
+  const ctx = await setup(t);
+  const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
+  assert.equal(isMixedTrack(clip), false);
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body)).status, 201);
+  const { policy, spoilerTerms } = loadPolicy(path.join(__dirname, '..', 'tools', 'twitch-shorts'));
+  const thin = { ...clip, commentary: { ...clip.commentary, speech_seconds_combined: 5, speech_seconds_live: 5 } };
+  assert.match(checkClipGates(thin, { env: ctx.env, policy, spoilerTerms, history: [] }).join(' '), /60%/);
+});
+
+test('upscaled packages (default 2160x3840) are accepted; other sizes are rejected', async t => {
+  const ctx = await setup(t, { pkgArgs: ['--upscale', '2160'] });
+  const { body, dir } = ctx.pkgs[0];
+  const clip = JSON.parse(fs.readFileSync(path.join(dir, 'clip.json'), 'utf8'));
+  assert.equal(clip.render.output_resolution, '2160x3840');
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', body)).status, 201);
+  const { policy, spoilerTerms } = loadPolicy(path.join(__dirname, '..', 'tools', 'twitch-shorts'));
+  const opts = { env: ctx.env, policy, spoilerTerms, history: [] };
+  for (const [up, res] of [['1440', '1440x2560'], ['off', '1080x1920'], ['skipped (source 2160x3840 already >= 2160x3840)', '2160x3840']]) {
+    assert.deepEqual(checkClipGates({ ...clip, render: { ...clip.render, upscale: up, output_resolution: res } }, opts), [], up);
+  }
+  assert.match(checkClipGates({ ...clip, render: { ...clip.render, upscale: '4320', output_resolution: '4320x7680' } }, opts).join(' '), /not allowed/);
+});
+
 test('overlapping range of the same VOD is a duplicate at ingest', async t => {
   const ctx = await setup(t, { packages: 2, pkgArgs: i => ['--start', String(i * 10)] });
   assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body)).status, 201);
@@ -343,19 +397,21 @@ test('overlapping range of the same VOD is a duplicate at ingest', async t => {
   assert.match(r.json.problems.join(' '), /overlaps ingested item/);
 });
 
-test('daily cap (default 1 from policy) and overlap duplicate across packages', async t => {
-  const ctx = await setup(t, { packages: 2, pkgArgs: i => ['--start', String(i * 100)] });
-  const [a, b] = ctx.pkgs.map(p => p.body);
+test('daily cap (default 2 from policy) and overlap duplicate across packages', async t => {
+  const ctx = await setup(t, { packages: 3, pkgArgs: i => ['--start', String(i * 100)] });
+  const [a, b, c] = ctx.pkgs.map(p => p.body);
   const ia = await ctx.call('POST', '/api/gta6/external-shorts', a);
   const ib = await ctx.call('POST', '/api/gta6/external-shorts', b);
+  const ic = await ctx.call('POST', '/api/gta6/external-shorts', c);
   assert.equal(ia.status, 201);
   assert.equal(ib.status, 201);
-  const up = await ctx.call('POST', `/api/gta6/external-shorts/${ia.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: a.packageSha256.slice(0, 12) });
-  assert.equal(up.status, 200);
-  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) });
+  assert.equal(ic.status, 201);
+  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ia.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: a.packageSha256.slice(0, 12) })).status, 200);
+  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) })).status, 200);
+  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ic.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: c.packageSha256.slice(0, 12) });
   assert.equal(capped.status, 422);
-  assert.match(capped.json.problems.join(' '), /daily cap reached: 1\/1/);
-  assert.equal(ctx.youtube.calls.length, 1);
+  assert.match(capped.json.problems.join(' '), /daily cap reached: 2\/2/);
+  assert.equal(ctx.youtube.calls.length, 2);
 });
 
 test('ambiguous upload error marks unknown_reconcile; public response is flagged', async t => {

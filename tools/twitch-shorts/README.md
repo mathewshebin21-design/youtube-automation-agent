@@ -32,7 +32,7 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
 - Example: `review.py commentary --mic-stream 1 --audio vo.wav --tts --voice-preset puck-hyped --caption-style yellow-pop --captions`
 
 ## Phase 2.2 (blocking fixes)
-- **Daily cap is hard-capped at 1.** The effective cap is `min(CUTSCENECITY_DAILY_CAP or policy daily_upload_cap, 1)`, in both Python and Node. A value of 0, a negative value or anything unparseable blocks all uploads (fail closed).
+- **Daily cap is hard-capped at 2** (raised from 1 in Phase 2.5). The effective cap is `min(CUTSCENECITY_DAILY_CAP or policy daily_upload_cap, 2)`, in both Python and Node; the policy default is 2. Values above 2 clamp to 2. A value of 0, a negative value or anything unparseable blocks all uploads (fail closed). Attempts are counted per **IST calendar day (UTC+05:30, midnight to midnight)** from the shared ledger.
 - **New required human check: `overlays_third_parties_cleared`.** It confirms that chat, alerts and usernames are blurred in the final render, that no viewer TTS or donation messages can be heard, and that no guest or voice-chat audio is in the mix.
   - `review.py precheck` now runs `overlay_scan.py` on the final render. It uses edge density (OpenCV) plus tesseract OCR when installed. OCR text is never stored, only counts and boxes.
   - The scan only flags. When it flags something, or can't run, the sign-off needs a note of 5+ words.
@@ -49,3 +49,34 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
   - loudnorm is overall loudness only.
   - With OBS multitrack, put game/desktop audio on track 1 without the mic, so the mic isn't doubled.
   - Licensed in-game radio music may trigger Content ID claims, so review it before any upload. `music_risk_cleared` still needs the fingerprint pre-check and a note.
+
+## OBS audio setup and the mixed-track path (Phase 2.3)
+- **OBS Twitch VOD Track.** In OBS, **track 1 is the live audio feed and track 2 is the VOD audio feed** by default. A source left off track 2 isn't in the Twitch VOD. Tracks 3-6 stay free for separating audio for editing. The setting is Settings → Output → Twitch VOD Track, and your Twitch account must be connected under Settings → Stream. (VERIFIED: OBS knowledge base, "Twitch VOD Track Guide", obsproject.com/kb/twitch-vod-track-guide.)
+  - CutsceneCity routing: track 1 = live mix; track 2 (Twitch VOD Track) = mic + game + story audio, all kept.
+- **A downloaded Twitch VOD still has ONE mixed audio track.** The VOD Track only chooses *what* goes into the VOD; the mic isn't stored separately. VOD 2937578726 probes as 1 video + 1 stereo audio stream (checked with ffprobe here). Commentary therefore can't be measured from the VOD.
+- **For the best gate results, also keep a local OBS recording with the mic on its own track.** Set Settings → Output → Recording → Audio Track to tick e.g. 1 + 3, and put only the mic on track 3. Then run `review.py commentary --clip <clip> --mic-stream N` with the 0-based audio index; the measured mic path is preferred automatically.
+- **Mixed-track path (no mic stem; creator-owned VODs only).** `original_commentary` and `live_reaction_preserved` show **WARN**, not FAIL. They pass only after a signed `review.py signoff --check mixed_track_commentary_confirmed --by NAME --note "<5+ words: live commentary audible>"`.
+  - The manifest records `commentary_source: mic_stem | mixed_track_signed`.
+  - The voice-band "speech share" (`mixed_track_speech_share`) is a hint only. Game voices, cutscene dialogue and music count too; on VOD 2937578726 it reads 100% for every clip.
+  - Non-owner VODs are still rejected.
+- **Music in the VOD track.** Twitch scans VODs and clips for copyrighted audio and mutes the matching VOD portions and deletes matching clips (VERIFIED: Twitch Help, "Copyrighted Audio Detection & Warnings"). Licensed music, such as in-game radio, may also get YouTube Content ID claims on the Short (UNVERIFIED this pass: standard Content ID behaviour, YouTube docs not re-checked).
+- UNVERIFIED (community reports only, not official docs): Twitch Enhanced Broadcasting or a third-party "soundtrack" plugin can override the VOD Track routing. Check one test VOD after any OBS change.
+- **Automatic now:** `qa.py` runs at the end of `--render`. The description starts with a factual credit line built from info.json: `From my Twitch stream: https://www.twitch.tv/<login> — full VOD: <url>`. `containsSyntheticMedia` is filled in automatically (true if TTS/AI voice/visuals are used, else false), with the reason recorded.
+  - `paid_promotion` is only *suggested* (`none`) in `status`; it still has to be signed with `review.py paid`.
+  - Title, your description text and the transformation note are never generated. `review.py status` lists what's missing and the command for each.
+
+## Upscale step (Phase 2.4, ON by default)
+
+- Every `--render` upscales the captioned 1080x1920 output to **2160x3840 by default**. Choose `--upscale 1440|2160|off` (flag), or set `CUTSCENECITY_UPSCALE` (the flag wins over the env var). Use `off` only for tests and debugging; the test suite sets `CUTSCENECITY_UPSCALE=off` so it stays fast.
+- Order: ffmpeg render + captions → **upscale** → `qa.py` → overlay scan / `review.py precheck` → export SHA-256. QA, the overlay scan, precheck and the package hash all cover the final upscaled file.
+- Method: ffmpeg `scale=W:H:flags=lanczos,unsharp=5:5:0.5:5:5:0.0`, libx264 preset medium, CRF 18, yuv420p, `+faststart`. The audio stream is copied unchanged (`-c:a copy`). The file is replaced in place through a temp file.
+- It never upscales past the target. If the source is already at or above the target, the step is skipped and `render.upscale` records `skipped (...)`.
+- **Honest note:** upscaling a 1080p source adds **no real detail**. The only benefit is that YouTube serves a 2160p upload with its higher-bitrate encode (VP9/AV1 4K ladder), which usually looks cleaner on phones than the 1080p encode.
+- Measured on a 35 s 1080x1920 clip (8 vCPU box): about **+54 s** render time, and the file grew from **17.6 MB to 67.1 MB** (~3.8x, ~15 Mb/s). Audio MD5 was unchanged and qa passed.
+- The Node route (`POST /api/gta6/external-shorts`) and `upload_private.py` accept 1080x1920, 1440x2560 and 2160x3840. The Node route rejects any other `render.upscale` value or output resolution.
+- Re-render with the commentary stem: `review.py commentary ... --upscale 2160` (default) or `--upscale off`.
+
+## Daily cap 2 (Phase 2.5)
+
+- Shebin approved raising the cap from 1 to 2 uploads per day. The hard clamp is `min(cap, 2)` in `gatelog.py` and `external-shorts.js`, and `daily_upload_cap` defaults to 2 in `editorial-policy.json` and `.env.example`.
+- Unchanged: 0, negative or unreadable values block all uploads; values above 2 clamp to 2; the day boundary is the IST calendar day (UTC+05:30); every upload is still private-only and needs its own human approval; `upload_private.py` and the Node route both re-check the cap and duplicates against the shared ledger.
