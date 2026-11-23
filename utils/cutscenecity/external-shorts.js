@@ -14,7 +14,7 @@
  *                                 ("cutscenecity"); if both are empty everything is blocked
  *   CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY  default true (TTS counts toward 60% only with the AI disclosure)
  *   CUTSCENECITY_STATE_DIR        shared upload audit ledger (default ~/.cutscenecity)
- *   CUTSCENECITY_DAILY_CAP        overrides editorial-policy.json daily_upload_cap; clamped to max 1, <=0 or invalid = blocked
+ *   CUTSCENECITY_DAILY_CAP        overrides editorial-policy.json daily_upload_cap; clamped to max 2, <=0 or invalid = blocked; counted per IST day
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -24,11 +24,12 @@ const path = require('path');
 const TOOLS_DIR = path.join(__dirname, '..', '..', 'tools', 'twitch-shorts');
 const SIM = { flagAt: 0.40, rejectAbove: 0.50, nearLine: 0.80, history: 30, shingle: 3 };
 const REQUIRED_HUMAN_CHECKS = ['vod_rights_confirmed', 'no_story_cutscene', 'music_risk_cleared', 'overlays_third_parties_cleared'];
-const HARD_DAILY_CAP = 1;
+const HARD_DAILY_CAP = 2; // raised from 1 in Phase 2.5; day boundary = IST (UTC+05:30)
+const ALLOWED_RESOLUTIONS = ['1080x1920', '1440x2560', '2160x3840'];
 const PAID_VALUES = ['none', 'present'];
 const YT_PART = 'snippet,status,paidProductPlacementDetails';
 
-/** min(env or policy, 1); 0, negative or unparseable = 0 (blocked). Same rule as gatelog.effective_daily_cap. */
+/** min(env or policy, 2); 0, negative or unparseable = 0 (blocked). Same rule as gatelog.effective_daily_cap. */
 function effectiveDailyCap(envValue, policyValue) {
   let raw = envValue !== undefined && envValue !== null && envValue !== '' ? envValue : policyValue;
   if (raw === undefined || raw === null) raw = HARD_DAILY_CAP;
@@ -190,6 +191,9 @@ function checkScript(text, history, ownKey) {
 const clipKey = clip => sha256Json({ url: (clip.provenance || {}).source_url || '', start_ms: Math.round(Number(clip.start) * 1000), end_ms: Math.round(Number(clip.end) * 1000) });
 const ttsCounts = env => !['false', '0', 'no', 'off'].includes(String(env.CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY ?? 'true').trim().toLowerCase());
 
+/** No separate creator mic stem anywhere: commentary lives only in the single mixed VOD track. */
+const isMixedTrack = clip => !((clip.commentary || {}).mic_source) && !((clip.render || {}).mic_source);
+
 /** Independent JS re-check of the gates (does not trust statuses saved by Python). */
 function checkClipGates(clip, { env, policy, spoilerTerms, history = [], previous = null }) {
   const p = [];
@@ -214,11 +218,25 @@ function checkClipGates(clip, { env, policy, spoilerTerms, history = [], previou
   const synthetic = Boolean(c.tts_used || clip.ai_visuals_used);
   if (synthetic && md.containsSyntheticMedia !== true) p.push('TTS/AI used: containsSyntheticMedia must be true');
   if (typeof md.containsSyntheticMedia !== 'boolean') p.push('containsSyntheticMedia must be answered');
-  if (!['mix', 'mic_stem'].includes(r.audio_mode) || !r.mic_source || r.mic_gain !== 1) p.push('live reaction: creator mic stem must be in the mix at full level (no mute/duck)');
-  const runtime = Number(clip.end) - Number(clip.start);
-  const min = Math.max(0.6, Number(policy.min_commentary_coverage) || 0.6);
-  const speech = Number((ttsCounts(env) ? c.speech_seconds_combined : c.speech_seconds_live) || 0);
-  if (!c.mic_source || !(runtime > 0) || speech / runtime < min) p.push('commentary (VAD on mic + TTS bus) must cover at least 60% of runtime');
+  // Upscale (default 2160 in the Python render): only these final resolutions are accepted.
+  if (r.upscale !== undefined && !(['off', '1440', '2160'].includes(String(r.upscale)) || String(r.upscale).startsWith('skipped'))) p.push(`render.upscale ${r.upscale} is not allowed (1440, 2160 or off)`);
+  if (r.output_resolution !== undefined && !ALLOWED_RESOLUTIONS.includes(r.output_resolution)) p.push(`output resolution ${r.output_resolution} is not an accepted 9:16 size`);
+  const mixed = isMixedTrack(clip);
+  if (mixed) {
+    // Mixed-track path (single Twitch VOD track): creator-owned only, kept at full level, and a signed human confirmation.
+    if (!own) p.push('mixed track: only creator-owned VODs may use the mixed-track path');
+    if ((r.audio_mode || 'source') !== 'source' || Number(r.music_volume ?? 1) !== 1) p.push('mixed track must be kept unchanged at full level');
+    const conf = (clip.compliance || {}).mixed_track_commentary_confirmed || {};
+    if (conf.status !== 'PASS' || conf.not_applicable || c.commentary_source !== 'mixed_track_signed') {
+      p.push('mixed track: commentary not measurable; needs signed mixed_track_commentary_confirmed (commentary_source=mixed_track_signed)');
+    }
+  } else {
+    if (!['mix', 'mic_stem'].includes(r.audio_mode) || !r.mic_source || r.mic_gain !== 1) p.push('live reaction: creator mic stem must be in the mix at full level (no mute/duck)');
+    const runtime = Number(clip.end) - Number(clip.start);
+    const min = Math.max(0.6, Number(policy.min_commentary_coverage) || 0.6);
+    const speech = Number((ttsCounts(env) ? c.speech_seconds_combined : c.speech_seconds_live) || 0);
+    if (!c.mic_source || !(runtime > 0) || speech / runtime < min) p.push('commentary (VAD on mic + TTS bus) must cover at least 60% of runtime');
+  }
   const script = clip.commentary_script || {};
   if (c.tts_used && !script.text) p.push('TTS used: a human-edited, approved script is required');
   if (script.text) {
@@ -396,6 +414,11 @@ class ExternalShortsService {
       if (so && String(so.note || '').split(/\s+/).filter(Boolean).length < 5) p.push('overlays_third_parties_cleared: scan flagged or unavailable, sign-off needs a 5+ word note');
     }
     const humanChecks = REQUIRED_HUMAN_CHECKS.concat((policy.extra_human_checks || []).map(c => c.name));
+    if (isMixedTrack(clip)) {
+      humanChecks.push('mixed_track_commentary_confirmed');
+      const so = entries.filter(e => e.action === 'signoff' && e.check === 'mixed_track_commentary_confirmed' && e.clip === pkg.clip && e.file_sha256 === fileSha).pop();
+      if (so && String(so.note || '').split(/\s+/).filter(Boolean).length < 5) p.push('mixed_track_commentary_confirmed: signed note must have 5+ words');
+    }
     const signed = new Set(entries.filter(e => e.action === 'signoff' && e.clip === pkg.clip && e.file_sha256 === fileSha).map(e => e.check));
     humanChecks.filter(n => !signed.has(n)).forEach(n => p.push(`${n}: no signed human sign-off for this file`));
     p.push(...checkClipGates(clip, { env: this.env, policy, spoilerTerms, history: this.readHistory(), previous: this.previousUpload(pkg.package_sha256) }));
@@ -498,4 +521,4 @@ function registerExternalShortsRoutes(app, getService, { env = process.env } = {
   });
 }
 
-module.exports = { ExternalShortsService, checkClipGates, loadPolicy, ownerMatch, checkScript, clipKey, effectiveDailyCap, REQUIRED_HUMAN_CHECKS, registerExternalShortsRoutes, canonicalJson, sha256Json, signEntry, verifyReviewLog, validateImport, GateError };
+module.exports = { ExternalShortsService, isMixedTrack, checkClipGates, loadPolicy, ownerMatch, checkScript, clipKey, effectiveDailyCap, REQUIRED_HUMAN_CHECKS, registerExternalShortsRoutes, canonicalJson, sha256Json, signEntry, verifyReviewLog, validateImport, GateError };

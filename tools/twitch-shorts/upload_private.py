@@ -8,7 +8,7 @@
 Hard rules in code (no flag turns them off):
   privacyStatus=private, selfDeclaredMadeForKids=false, no publishAt, containsSyntheticMedia sent explicitly,
   scope youtube.upload only, signed approval must match the exact file + metadata, every compliance check PASS,
-  daily cap (default 1/day IST) + duplicate check, and an audit line before and after every attempt.
+  daily cap (default 2/day, hard max 2, IST calendar day) + duplicate check, and an audit line before and after every attempt.
 Credentials: OAuth Desktop client JSON at CUTSCENECITY_CLIENT_SECRETS; token cached at
 CUTSCENECITY_STATE_DIR/token.json (chmod 600). Neither is ever inside the repo or printed.
 """
@@ -84,13 +84,20 @@ def verify_package(pkg_dir):
             problems.append("paid_promotion: no signed declaration for this file")
         if pkg["upload"].get("paidProductPlacement") is not (paid == "present") or paid not in compliance.PAID_VALUES:
             problems.append("paidProductPlacement in package does not match the signed paid_promotion")
+        if compliance.is_mixed_track(clip):
+            so = [e for e in entries if e.get("action") == "signoff" and e.get("check") == "mixed_track_commentary_confirmed"
+                  and e.get("clip") == pkg["clip"] and e.get("file_sha256") == pkg["file_sha256"]]
+            if so and len((so[-1].get("note") or "").split()) < 5:
+                problems.append("mixed_track_commentary_confirmed: signed note must have 5+ words")
+            if (clip.get("commentary") or {}).get("commentary_source") != "mixed_track_signed":
+                problems.append("commentary_source must be mixed_track_signed for a clip without a mic stem")
         scan = clip.get("overlay_scan") or {}
         if scan.get("file_sha256") != pkg["file_sha256"]:
             problems.append("overlay scan was not run on this exact file")
         signed = {e["check"] for e in entries if e.get("action") == "signoff" and e.get("clip") == pkg["clip"]
                   and e.get("file_sha256") == pkg["file_sha256"]}
-        for n, s in compliance.CHECKS.items():
-            if s["kind"] == "human" and n not in signed:
+        for n in compliance.required_human_checks(clip):
+            if n not in signed:
                 problems.append(f"{n}: no signed sign-off")
     except PermissionError as e:
         problems.append(str(e))
