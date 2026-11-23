@@ -1,0 +1,8 @@
+__pycache__/
+output/
+packages/
+vod.*
+*.srt
+client_secret*.json
+token.json
+review_log.jsonl
