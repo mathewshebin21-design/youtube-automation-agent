@@ -1,0 +1,2 @@
+# One term per line, case-insensitive whole-word match against title, description and tags.
+# Built-in defaults are in compliance.py (ending, final mission, dies, twist, leak ...). Add GTA 6 story names here.
