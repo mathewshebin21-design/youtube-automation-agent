@@ -1,0 +1,8 @@
+# Local Mac only (never installed in GitHub Actions).
+# Gated PRIVATE upload:
+google-api-python-client>=2.100,<3
+google-auth-oauthlib>=1.2,<2
+google-auth-httplib2>=0.2
+# Optional caption burn-in (skipped gracefully when missing):
+faster-whisper>=1.0
+# Optional music fingerprint pre-check: `brew install chromaprint` (provides fpcalc)
