@@ -1,0 +1,20 @@
+{
+  "_comment": "Shared by compliance.py and the Node ingest route; whole-word, case-insensitive.",
+  "terms": [
+    "ending",
+    "final mission",
+    "final boss",
+    "dies",
+    "death of",
+    "killed off",
+    "twist",
+    "post-credits",
+    "secret ending",
+    "last mission",
+    "spoiler",
+    "who is the villain",
+    "betrayal",
+    "leak",
+    "leaked"
+  ]
+}
