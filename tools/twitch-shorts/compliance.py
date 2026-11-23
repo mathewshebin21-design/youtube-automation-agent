@@ -32,17 +32,28 @@ TWITCH_VOD_ID = re.compile(r"^https://(?:www\.)?twitch\.tv/videos/(\d+)$")
 DEFAULT_SPOILERS = json.loads((pathlib.Path(__file__).parent / "spoiler-defaults.json").read_text())["terms"]
 
 
-def register_check(name, kind="auto", description=""):
+def register_check(name, kind="auto", description="", applies=None):
+    """applies(clip) -> bool: a human check that does not apply to this clip is recorded as PASS/not_applicable
+    and needs no signature (e.g. mixed_track_commentary_confirmed when a mic stem exists)."""
     if kind not in ("auto", "human"):
         raise ValueError("kind must be auto or human")
 
     def deco(fn):
-        CHECKS[name] = {"kind": kind, "description": description, "fn": fn}
+        CHECKS[name] = {"kind": kind, "description": description, "fn": fn, "applies": applies}
         return fn
     if name in CHECKS:
         raise ValueError(f"check {name} already registered")
-    CHECKS[name] = {"kind": kind, "description": description, "fn": None}
+    CHECKS[name] = {"kind": kind, "description": description, "fn": None, "applies": applies}
     return deco
+
+
+def applies(name, clip):
+    fn = CHECKS[name].get("applies")
+    return True if fn is None else bool(fn(clip))
+
+
+def required_human_checks(clip):
+    return [n for n, s in CHECKS.items() if s["kind"] == "human" and applies(n, clip)]
 
 
 def load_extra_checks(policy):
@@ -230,6 +241,55 @@ def speech_seconds(audio_path, noise_db=-35, min_silence=0.4):
     return max(0.0, total - silent)
 
 
+def mixed_speech_share(media, start=None, end=None):
+    """HINT ONLY: share of the clip where the mixed VOD track has voice-band energy (300-3400 Hz energy VAD).
+    Game voices, cutscene dialogue and music count as speech too, so this can never pass a gate on its own."""
+    args = ["ffmpeg", "-hide_banner"]
+    if start is not None:
+        args += ["-ss", str(start), "-t", str(float(end) - float(start))]
+    args += ["-i", str(media), "-vn", "-af", "highpass=f=300,lowpass=f=3400,silencedetect=noise=-30dB:d=0.3", "-f", "null", "-"]
+    p = subprocess.run(args, capture_output=True, text=True)
+    dur = (float(end) - float(start)) if start is not None else None
+    if dur is None:
+        m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", p.stderr)
+        if not m:
+            return None
+        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    if p.returncode != 0 or dur <= 0:
+        return None
+    silent = sum(float(x) for x in re.findall(r"silence_duration: ([\d.]+)", p.stderr))
+    return round(max(0.0, min(1.0, (dur - silent) / dur)), 3)
+
+
+def is_mixed_track(clip):
+    """No separate creator mic stem: commentary is only in the single mixed VOD track."""
+    return not (clip.get("commentary") or {}).get("mic_source") and not (clip.get("render") or {}).get("mic_source")
+
+
+def mixed_track_signed(clip):
+    return (is_mixed_track(clip) and owner_ok(clip)
+            and (clip.get("compliance") or {}).get("mixed_track_commentary_confirmed", {}).get("status") == PASS
+            and not clip["compliance"]["mixed_track_commentary_confirmed"].get("not_applicable"))
+
+
+def owner_ok(clip):
+    return creator_owned_source(clip, {"policy": None})[0] == PASS
+
+
+@register_check("mixed_track_commentary_confirmed", "human",
+                "Mixed-track path (no mic stem; Twitch VOD has one mixed track): a person listened to the whole clip and "
+                "confirms the creator's live commentary is clearly audible over the game audio. Note of 5+ words required.",
+                applies=is_mixed_track)
+def mixed_track_hint(clip, ctx):
+    if not owner_ok(clip):
+        return FAIL, "mixed-track path is only for creator-owned VODs (creator_owned_source must pass)"
+    share = (clip.get("commentary") or {}).get("mixed_track_speech_share")
+    if share is None:
+        return WARN, "no speech hint yet (review.py precheck); listen to the whole clip; note required"
+    return WARN, (f"voice-band activity in {share:.0%} of the clip (hint only: game voices/music count too); "
+                  "confirm YOUR live commentary is audible; note required")
+
+
 def tts_counts(env=None):
     env = os.environ if env is None else env
     return str(env.get("CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY", "true")).strip().lower() not in ("false", "0", "no", "off")
@@ -241,7 +301,14 @@ def tts_counts(env=None):
 def commentary_gate(clip, ctx):
     c = clip.get("commentary") or {}
     if not c.get("mic_source"):
-        return FAIL, "no creator mic stem attached (review.py commentary --mic/--mic-stream)"
+        if not owner_ok(clip):
+            return FAIL, "no creator mic stem and the VOD is not creator-owned"
+        if mixed_track_signed(clip):
+            return PASS, "mixed_track_signed: reviewer confirmed live commentary is audible (no mic stem to measure)"
+        share = c.get("mixed_track_speech_share")
+        hint = f"; voice-band hint {share:.0%} (game voices count too)" if share is not None else ""
+        return WARN, ("no mic stem: commentary cannot be measured on the single mixed track" + hint +
+                      ". Sign mixed_track_commentary_confirmed, or attach an OBS mic track (review.py commentary --mic-stream N)")
     if c.get("tts_used") and (clip.get("metadata") or {}).get("containsSyntheticMedia") is not True:
         return FAIL, "TTS used: containsSyntheticMedia must be true"
     runtime = float(clip["end"]) - float(clip["start"])
@@ -258,6 +325,12 @@ def commentary_gate(clip, ctx):
                 "The creator's real mic/reaction track is in the final mix at full level (never muted or ducked).")
 def live_reaction_gate(clip, ctx):
     r = clip.get("render") or {}
+    if is_mixed_track(clip) and r.get("audio_mode", "source") == "source" and owner_ok(clip):
+        if r.get("music_volume", 1.0) != 1.0:
+            return FAIL, "mixed track was lowered (music volume < 1.0 also lowers the creator voice in a mixed track)"
+        if mixed_track_signed(clip):
+            return PASS, "mixed_track_signed: original mixed track (creator voice included) kept at full level"
+        return WARN, "single mixed VOD track kept at full level; sign mixed_track_commentary_confirmed (voice audible)"
     if r.get("audio_mode") not in ("mix", "mic_stem") or not r.get("mic_source"):
         return FAIL, ("no separate creator mic stem in the final mix; Twitch VODs have one mixed track, so the mic "
                       "cannot be separated: record an OBS multitrack (mic on its own track) and pass --mic-stream/--mic")
@@ -373,6 +446,18 @@ def spoiler_gate(clip, ctx):
 
 
 # ---------- gate 6 (part): disclosure ----------
+def auto_disclosure(clip):
+    """Fill containsSyntheticMedia when unanswered: true if TTS/AI voice or AI visuals are used, else false.
+    Never flips an explicit answer (an explicit false with AI use still FAILS the gate)."""
+    md = clip.setdefault("metadata", {})
+    uses_ai = bool((clip.get("commentary") or {}).get("tts_used") or clip.get("ai_visuals_used"))
+    if md.get("containsSyntheticMedia") is None:
+        md["containsSyntheticMedia"] = uses_ai
+        clip["synthetic_disclosure_reason"] = ("auto: TTS/AI voice or AI visuals used" if uses_ai
+                                               else "auto: no TTS, AI voice or AI visuals recorded for this clip")
+    return clip
+
+
 @register_check("synthetic_disclosure", "auto",
                 "containsSyntheticMedia is true whenever TTS or AI visuals are used.")
 def disclosure_gate(clip, ctx):
@@ -404,12 +489,21 @@ def evaluate(clip, ctx=None):
     ctx = ctx or {}
     init_clip(clip)
     for name, spec in CHECKS.items():
+        if name == "synthetic_disclosure":
+            auto_disclosure(clip)
         entry = clip["compliance"][name]
         fn = spec["fn"]
         result = fn(clip, ctx) if fn else (WARN, "no automatic hint")
         if spec["kind"] == "auto":
-            entry.update({"status": result[0] if result[0] in (PASS, FAIL) else FAIL, "evidence": result[1]})
+            # WARN stays WARN (still blocking: only PASS unblocks)
+            entry.update({"status": result[0] if result[0] in (PASS, FAIL, WARN) else FAIL, "evidence": result[1]})
+        elif not applies(name, clip):
+            entry.clear()
+            entry.update({"status": PASS, "not_applicable": True, "evidence": "not applicable to this clip"})
         else:
+            if entry.get("not_applicable"):
+                entry.clear()
+                entry["status"] = PENDING
             entry["hint"], entry["hint_evidence"] = result
             if result[0] == FAIL and entry.get("status") == PASS:
                 entry.update({"status": PENDING, "revoked": "hint failed after sign-off: " + result[1]})
@@ -419,6 +513,8 @@ def evaluate(clip, ctx=None):
 def signoff(clip, name, by, note="", ctx=None):
     if name not in CHECKS or CHECKS[name]["kind"] != "human":
         raise ValueError(f"{name} is not a human check")
+    if not applies(name, clip):
+        raise ValueError(f"{name} does not apply to this clip")
     if not by.strip():
         raise ValueError("reviewer name required")
     evaluate(clip, ctx)

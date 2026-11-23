@@ -11,6 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import compliance  # noqa: E402
+import qa  # noqa: E402
 import render  # noqa: E402
 import signals  # noqa: E402
 
@@ -66,6 +67,14 @@ def layout_profile(name):
     return profiles[name]
 
 
+def credit_line(owner, vod_url):
+    """Factual attribution default from yt-dlp info.json fields only (no promo copy)."""
+    login = (owner.get("uploader_id") or "").strip()
+    if not login or not vod_url:
+        return ""
+    return f"From my Twitch stream: https://www.twitch.tv/{login} \u2014 full VOD: {vod_url}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", help="YOUR OWN Twitch VOD URL (no default; own VODs only)")
@@ -83,6 +92,7 @@ def main():
     parser.add_argument("--facecam-box", help="x,y,w,h fractions of the source frame, for --layout split")
     parser.add_argument("--captions", action="store_true", help="burn in faster-whisper captions if installed")
     parser.add_argument("--info-json", help="yt-dlp .info.json for --input files (owner check needs it)")
+    parser.add_argument("--upscale", default=None, help="2160 (default) | 1440 | off; env CUTSCENECITY_UPSCALE")
     parser.add_argument("--profile", default=None, help="stream-layout profile name from editorial-policy.json")
     args = parser.parse_args()
     if not 15 <= args.seconds <= 60:
@@ -139,15 +149,20 @@ def main():
                                "source_channel_name": owner.get("uploader") or owner.get("uploader_id") or "",
                                "source_channel_id": owner.get("uploader_id") or owner.get("channel_id") or "",
                                "source_owner": owner},
-                "metadata": {"title": "", "description": "", "tags": [], "privacyStatus": "private", "containsSyntheticMedia": None},
+                "metadata": {"title": "", "description": credit_line(owner, source_url), "tags": [], "privacyStatus": "private",
+                             "containsSyntheticMedia": None},
+                "commentary": {"mic_source": None, "tts_used": False, "commentary_source": None},
+                "paid_promotion_suggestion": "none",
                 "transformation_note": ""}
         compliance.init_clip(clip)
         if args.render:
             clip["render"] = render.render(video, row["start"], row["end"], out, name, captions=args.captions,
                                            layout=args.layout, crop_x=crop_x, facecam=facecam,
-                                           blur_regions=profile.get("blur_regions", []))
+                                           blur_regions=profile.get("blur_regions", []), upscale=args.upscale)
             clip["render"]["facecam"] = facecam
             clip["render"]["profile"] = args.profile
+            clip["technical_qa"] = qa.validate(out / name, row["start"], row["end"])
+            clip["commentary"]["mixed_track_speech_share"] = compliance.mixed_speech_share(out / name)
         compliance.evaluate(clip, {})
         manifest["clips"].append(clip)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))

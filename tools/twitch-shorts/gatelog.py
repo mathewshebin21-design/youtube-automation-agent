@@ -104,11 +104,11 @@ def _final_states(entries):
     return state.values()
 
 
-HARD_DAILY_CAP = 1
+HARD_DAILY_CAP = 2  # raised from 1 to 2 in Phase 2.5 (Shebin's approval); day boundary = IST (UTC+05:30)
 
 
 def effective_daily_cap(env_value=None, policy_value=None):
-    """min(env or policy, 1). Nothing can raise it above 1; 0, negative or unparseable means blocked."""
+    """min(env or policy, 2). Nothing can raise it above 2; 0, negative or unparseable means blocked."""
     raw = env_value if env_value not in (None, "") else policy_value
     if raw is None:
         raw = HARD_DAILY_CAP

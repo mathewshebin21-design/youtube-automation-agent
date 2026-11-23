@@ -62,7 +62,7 @@
     168
   ],
   "min_commentary_coverage": 0.6,
-  "daily_upload_cap": 1,
+  "daily_upload_cap": 2,
   "spoiler_keywords_file": "spoiler-keywords.txt",
   "upload_privacy": "private_only",
   "extra_human_checks": [],
@@ -129,7 +129,7 @@
       ]
     }
   },
-  "daily_upload_cap_note": "Hard maximum 1 in code (Python and Node): min(env or policy, 1); 0/negative/invalid blocks.",
+  "daily_upload_cap_note": "Hard maximum 2 in code (Python and Node): min(env or policy, 2); 0/negative/invalid blocks. Counted per IST (UTC+05:30) calendar day.",
   "paid_promotion_values": [
     "none",
     "present"
