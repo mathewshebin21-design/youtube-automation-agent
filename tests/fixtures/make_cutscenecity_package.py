@@ -13,6 +13,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2] / "tools" / "twitch-shorts"
 sys.path.insert(0, str(ROOT))
 import compliance  # noqa: E402
+import edit_gates  # noqa: E402
 import gatelog  # noqa: E402
 import review  # noqa: E402
 
@@ -44,6 +45,16 @@ p.add_argument("--mixed", action="store_true", help="single mixed VOD track (no 
 p.add_argument("--mixed-note", default="my live commentary is clearly audible throughout")
 p.add_argument("--overlay-flagged", choices=["no", "yes", "unknown"], default="no")
 p.add_argument("--overlay-note", default="watched the whole clip, gameplay only")
+p.add_argument("--edit", choices=["off", "clean", "hype"], default="off", help="phase 2.7: render edit style (recorded human choice)")
+p.add_argument("--effects", default=None, help="comma list for --edit (default: captions for clean, punch_in,end_fade for hype)")
+p.add_argument("--no-edit-choice", action="store_true", help="simulate an edit applied without a signed human choice")
+p.add_argument("--captions", default=None, help="caption text (one word per 0.5 s from 12 s) -> burned word captions + words.json")
+p.add_argument("--caption-start", type=float, default=12.0)
+p.add_argument("--raw-profanity", action="store_true", help="do not mask profanity (simulates a bypass)")
+p.add_argument("--caption-note", default="read every caption word against the video")
+p.add_argument("--skip-caption-review", action="store_true")
+p.add_argument("--flash-cuts", type=int, default=0)
+p.add_argument("--flash-intensity", type=float, default=0.5)
 a = p.parse_args()
 work = pathlib.Path(a.workdir)
 out = work / "output"
@@ -71,9 +82,32 @@ if a.upscale:
 if a.mixed:
     clip["commentary"] = {"path": None, "mic_source": None, "tts_used": False, "mixed_track_speech_share": 0.7}
     clip["render"] = {"audio_mode": "source", "mic_source": None, "music_volume": 1.0, "layout": "blur", "captions": "OFF"}
+effects = []
+if a.edit != "off":
+    effects = edit_gates.parse_effects(a.effects) if a.effects is not None else (["captions"] if a.edit == "clean" else ["punch_in", "end_fade"])
+    effects = sorted(set(effects), key=edit_gates.EFFECTS.index)   # same order edit_gates.validate_choice records
+    clip["render"].update({"edit_style": a.edit, "edit_effects": effects, "pre_edit_file": "short_01.preedit.mp4"})
+    if a.flash_cuts:
+        clip["render"].update({"flash_cuts": [5.0 * (i + 1) for i in range(a.flash_cuts)], "flash_intensity": a.flash_intensity})
+if a.captions is not None:
+    words = [{"word": w, "start": round(a.caption_start + i * 0.5, 2), "end": round(a.caption_start + i * 0.5 + 0.4, 2)}
+             for i, w in enumerate(a.captions.split())]
+    if not a.raw_profanity:
+        words = edit_gates.mask_words(words)
+    (out / "short_01.words.json").write_text(json.dumps(words, indent=1))
+    flags = edit_gates.caption_flags(words)
+    clip["render"].update({"captions": "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK", "caption_style": "word-pop-yellow",
+                           "caption_source": "mic_stream:1", "words_json": "short_01.words.json",
+                           "words_json_sha256": edit_gates.sha256_bytes(out / "short_01.words.json"),
+                           "caption_review": {**flags, "warnings": edit_gates.flag_reasons(flags)}})
 compliance.init_clip(clip)
 (out / "manifest.json").write_text(json.dumps({"clips": [clip]}))
 base = ["--output", str(out), "--clip", "short_01.mp4"]
+if a.edit != "off" and not a.no_edit_choice:
+    review.main(["edit", *base, "--style", a.edit, "--effects", ",".join(effects) or "none", "--by", "Tester", "--no-render"]
+                + (["--flash-intensity", str(a.flash_intensity)] if "flash_cut" in effects else []))
+if a.captions is not None and not a.skip_caption_review:
+    review.main(["signoff", *base, "--check", "captions_reviewed", "--by", "Tester", "--note", a.caption_note])
 if a.tts:
     sf = pathlib.Path(a.script_file) if a.script_file else work / "script.txt"
     if not a.script_file:

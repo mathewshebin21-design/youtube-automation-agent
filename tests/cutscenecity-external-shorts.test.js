@@ -8,7 +8,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  ExternalShortsService, registerExternalShortsRoutes, canonicalJson, validateImport, checkClipGates, isMixedTrack, loadPolicy, ownerMatch, checkScript, effectiveDailyCap, REQUIRED_HUMAN_CHECKS
+  ExternalShortsService, registerExternalShortsRoutes, canonicalJson, validateImport, checkClipGates, isMixedTrack, loadPolicy, ownerMatch, checkScript, effectiveDailyCap, REQUIRED_HUMAN_CHECKS,
+  captionFlags, renderEditProblems, STYLE_EFFECTS, FLASH_MAX_PER_CLIP, FLASH_MAX_INTENSITY, mixedTrackAllowed, HARD_DAILY_CAP
 } = require('../utils/cutscenecity/external-shorts');
 
 const PY = process.env.CUTSCENECITY_PYTHON || 'python3';
@@ -283,23 +284,22 @@ test('rotation: the next upload may not reuse the previous voice preset', async 
   assert.equal(rc.status, 201, JSON.stringify(rc.json));
 });
 
-test('daily cap is clamped to 2 and 0/invalid blocks (fail closed)', async t => {
-  for (const [env, pol, want] of [['5', 1, 2], ['2', 1, 2], [undefined, 2, 2], [undefined, 10, 2], ['', 3, 2], ['1', 2, 1], ['0', 1, 0], ['-2', 1, 0], ['abc', 1, 0], ['1.5', 1, 0], [undefined, 0, 0], [undefined, true, 0], [undefined, undefined, 2]]) {
+test('daily cap is clamped to 1 and 0/invalid blocks (fail closed)', async t => {
+  assert.equal(HARD_DAILY_CAP, 1); // phase 2.7: back from 2 to 1
+  for (const [env, pol, want] of [['5', 1, 1], ['2', 1, 1], [undefined, 2, 1], [undefined, 10, 1], ['', 3, 1], ['1', 2, 1], ['0', 1, 0], ['-2', 1, 0], ['abc', 1, 0], ['1.5', 1, 0], [undefined, 0, 0], [undefined, true, 0], [undefined, undefined, 1]]) {
     assert.equal(effectiveDailyCap(env, pol), want, `${env}/${pol}`);
   }
-  let ctx = await setup(t, { env: { CUTSCENECITY_DAILY_CAP: '5' }, packages: 3, pkgArgs: i => ['--start', String(i * 100)] });
-  const [a, b, c] = ctx.pkgs.map(p => p.body);
+  let ctx = await setup(t, { env: { CUTSCENECITY_DAILY_CAP: '5' }, packages: 2, pkgArgs: i => ['--start', String(i * 100)] });
+  const [a, b] = ctx.pkgs.map(p => p.body);
   const ia = await ctx.call('POST', '/api/gta6/external-shorts', a);
   const ib = await ctx.call('POST', '/api/gta6/external-shorts', b);
-  const ic = await ctx.call('POST', '/api/gta6/external-shorts', c);
   assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ia.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: a.packageSha256.slice(0, 12) })).status, 200);
-  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) })).status, 200);
-  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ic.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: c.packageSha256.slice(0, 12) });
+  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) });
   assert.equal(capped.status, 422);
-  assert.match(capped.json.problems.join(' '), /daily cap reached: 2\/2 upload attempts today \(IST\)/);
-  assert.equal(ctx.youtube.calls.length, 2);
-  ctx.service.now = () => new Date(Date.now() + 86400000); // next IST day: the 3rd one is allowed
-  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ic.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: c.packageSha256.slice(0, 12) })).status, 200);
+  assert.match(capped.json.problems.join(' '), /daily cap reached: 1\/1 upload attempts today \(IST\)/);
+  assert.equal(ctx.youtube.calls.length, 1);
+  ctx.service.now = () => new Date(Date.now() + 86400000); // next IST day: the 2nd one is allowed
+  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) })).status, 200);
   ctx = await setup(t, { env: { CUTSCENECITY_DAILY_CAP: '0' } });
   const r = await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body);
   assert.equal(r.status, 422);
@@ -344,8 +344,10 @@ test('paid promotion: explicit true for present, missing blocks, tamper blocks',
   assert.throws(() => makePackage(path.join(ctx.work, 'nopaid'), ['--paid', 'skip', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /paid_promotion/);
 });
 
-test('mixed-track path: creator-owned + signed confirmation passes; unsigned, lowered or foreign is blocked', async t => {
-  const ctx = await setup(t, { pkgArgs: ['--mixed'] });
+test('mixed-track path (opt-in): creator-owned + signed confirmation passes; unsigned, lowered or foreign is blocked', async t => {
+  process.env.CUTSCENECITY_ALLOW_MIXED_TRACK = 'true'; // phase 2.7: off by default; the Python fixture inherits this
+  t.after(() => { delete process.env.CUTSCENECITY_ALLOW_MIXED_TRACK; });
+  const ctx = await setup(t, { pkgArgs: ['--mixed'], env: { CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' } });
   const { body, dir } = ctx.pkgs[0];
   const clip = JSON.parse(fs.readFileSync(path.join(dir, 'clip.json'), 'utf8'));
   assert.ok(isMixedTrack(clip));
@@ -401,21 +403,18 @@ test('overlapping range of the same VOD is a duplicate at ingest', async t => {
   assert.match(r.json.problems.join(' '), /overlaps ingested item/);
 });
 
-test('daily cap (default 2 from policy) and overlap duplicate across packages', async t => {
-  const ctx = await setup(t, { packages: 3, pkgArgs: i => ['--start', String(i * 100)] });
-  const [a, b, c] = ctx.pkgs.map(p => p.body);
+test('daily cap (default 1 from policy) and overlap duplicate across packages', async t => {
+  const ctx = await setup(t, { packages: 2, pkgArgs: i => ['--start', String(i * 100)] });
+  const [a, b] = ctx.pkgs.map(p => p.body);
   const ia = await ctx.call('POST', '/api/gta6/external-shorts', a);
   const ib = await ctx.call('POST', '/api/gta6/external-shorts', b);
-  const ic = await ctx.call('POST', '/api/gta6/external-shorts', c);
   assert.equal(ia.status, 201);
   assert.equal(ib.status, 201);
-  assert.equal(ic.status, 201);
   assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ia.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: a.packageSha256.slice(0, 12) })).status, 200);
-  assert.equal((await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) })).status, 200);
-  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ic.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: c.packageSha256.slice(0, 12) });
+  const capped = await ctx.call('POST', `/api/gta6/external-shorts/${ib.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: b.packageSha256.slice(0, 12) });
   assert.equal(capped.status, 422);
-  assert.match(capped.json.problems.join(' '), /daily cap reached: 2\/2/);
-  assert.equal(ctx.youtube.calls.length, 2);
+  assert.match(capped.json.problems.join(' '), /daily cap reached: 1\/1/);
+  assert.equal(ctx.youtube.calls.length, 1);
 });
 
 test('ambiguous upload error marks unknown_reconcile; public response is flagged', async t => {
@@ -440,4 +439,125 @@ test('no YouTube client configured: approval refuses before any audit ATTEMPT', 
   const r = await ctx.call('POST', `/api/gta6/external-shorts/${ing.json.result.id}/approve-upload`, { reviewer: 'Shebin', confirm: body.packageSha256.slice(0, 12) });
   assert.equal(r.status, 503);
   assert.ok(!fs.existsSync(path.join(ctx.env.CUTSCENECITY_STATE_DIR, 'upload-audit.jsonl')));
+});
+
+// ---------- Phase 2.7 compliance fixes (edit stage) ----------
+const TOOLS = path.join(__dirname, '..', 'tools', 'twitch-shorts');
+const CAPTIONS_NOTE = 'read every caption word against the video, gameplay talk only';
+
+test('2.7 fix 1+7: default per-clip choice is clean (hype opt-in); an edit without a signed per-clip human choice is refused', async t => {
+  const { policy } = loadPolicy(TOOLS);
+  assert.equal(policy.edit_policy.default_edit_style, 'clean');
+  assert.deepEqual(STYLE_EFFECTS.clean, ['captions']);
+  const ctx = await setup(t, { pkgArgs: ['--edit', 'hype', '--effects', 'punch_in,end_fade'] });
+  const { body, dir } = ctx.pkgs[0];
+  const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+  assert.deepEqual(pkg.style.edit_effects, ['punch_in', 'end_fade']);
+  const log = fs.readFileSync(path.join(dir, 'review_log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const choice = log.find(e => e.action === 'edit_choice');
+  assert.deepEqual([choice.edit_style, choice.effects, choice.by], ['hype', ['punch_in', 'end_fade'], 'Tester']);
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', body)).status, 201);
+  // Python refuses to export an edit applied without a human choice
+  assert.throws(() => makePackage(path.join(ctx.work, 'nochoice'), ['--edit', 'hype', '--no-edit-choice'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  // Node independently: clip.json edited to another effect list than the signed choice
+  const clipPath = path.join(dir, 'clip.json');
+  const clip = JSON.parse(fs.readFileSync(clipPath, 'utf8'));
+  const swapped = { ...clip, edit_choice: { ...clip.edit_choice, effects: ['punch_in', 'shake'] }, render: { ...clip.render, edit_effects: ['punch_in', 'shake'] } };
+  fs.writeFileSync(clipPath, JSON.stringify(swapped));
+  ctx.service.save({ items: [] });
+  const r = await ctx.call('POST', '/api/gta6/external-shorts', body);
+  assert.equal(r.status, 422);
+  assert.match(r.json.problems.join(' '), /manifest choice differs from the signed choice/);
+  assert.match(renderEditProblems({ ...clip, edit_choice: undefined }).join(' '), /without a recorded human edit choice/);
+  assert.match(renderEditProblems({ ...clip, render: { ...clip.render, edit_style: 'clean', edit_effects: ['punch_in'] }, edit_choice: { ...clip.edit_choice, edit_style: 'clean', effects: ['punch_in'] } }).join(' '), /not allowed for edit style clean/);
+});
+
+test('2.7 fix 2+3: burned captions need a mic stem and a signed captions_reviewed bound to words.json', async t => {
+  const ctx = await setup(t, { pkgArgs: ['--edit', 'clean', '--captions', 'flanking left watch out bro', '--caption-note', CAPTIONS_NOTE] });
+  const { body, dir } = ctx.pkgs[0];
+  const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+  assert.equal(pkg.captions.file, 'captions.words.json');
+  assert.ok(fs.existsSync(path.join(dir, 'captions.words.json')));
+  const log = fs.readFileSync(path.join(dir, 'review_log.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const so = log.find(e => e.action === 'signoff' && e.check === 'captions_reviewed');
+  assert.equal(so.words_json_sha256, pkg.captions.words_json_sha256);
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', body)).status, 201);
+  // edited words.json after export -> blocked
+  ctx.service.save({ items: [] });
+  const wf = path.join(dir, 'captions.words.json');
+  const orig = fs.readFileSync(wf, 'utf8');
+  fs.writeFileSync(wf, orig.replace('flanking', 'Lucia'));
+  let r = await ctx.call('POST', '/api/gta6/external-shorts', body);
+  assert.equal(r.status, 422);
+  assert.match(r.json.problems.join(' '), /words\.json changed after render\/export/);
+  assert.match(r.json.problems.join(' '), /no signed caption review for this exact words\.json/);
+  fs.rmSync(wf);
+  r = await ctx.call('POST', '/api/gta6/external-shorts', body);
+  assert.match(r.json.problems.join(' '), /words\.json missing from the package/);
+  fs.writeFileSync(wf, orig);
+  // mixed-track (no mic stem) captions are refused by the Node gate
+  const clip = JSON.parse(fs.readFileSync(path.join(dir, 'clip.json'), 'utf8'));
+  const mixed = { ...clip, commentary: { ...clip.commentary, mic_source: null }, render: { ...clip.render, mic_source: null, caption_source: 'mixed_track' } };
+  assert.match(renderEditProblems(mixed).join(' '), /separate mic stem/);
+  // Python refuses to export captions without the human caption review
+  assert.throws(() => makePackage(path.join(ctx.work, 'noreview'), ['--edit', 'clean', '--captions', 'nice shot', '--skip-caption-review'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+});
+
+test('2.7 fix 4+5: profanity masked + first-10s flag; story names/plot keywords flagged; placeholders marked incomplete', async t => {
+  const { policy, spoilerTerms } = loadPolicy(TOOLS);
+  assert.equal(policy.caption_policy.audio_bleep, false);
+  assert.ok(policy.caption_policy.story_names.includes('Lucia') && policy.caption_policy.story_names.includes('Jason'));
+  assert.ok(policy.caption_policy.story_names.some(n => n.startsWith('PLACEHOLDER')));
+  const words = [
+    { word: 'f******', start: 2.0, end: 2.3, masked: true }, { word: 'Lucia', start: 4.0, end: 4.3 },
+    { word: 'final', start: 11, end: 11.2 }, { word: 'mission', start: 11.3, end: 11.6 }, { word: 's***', start: 15, end: 15.2, masked: true }
+  ];
+  const f = captionFlags(words, policy, spoilerTerms);
+  assert.deepEqual(f.profanityFirst10s, [2.0]);
+  assert.equal(f.profanityMasked, 2);
+  assert.deepEqual(f.keywordHits.map(h => h.term).sort(), ['Lucia', 'final mission']);
+  assert.equal(f.keywordListIncomplete, true);
+  assert.deepEqual(captionFlags([{ word: 'Fucking!', start: 1, end: 2 }], policy, spoilerTerms).unmaskedProfanity, [1]);
+  assert.deepEqual(captionFlags([{ word: 'PLACEHOLDER_STORY_NAME_1', start: 1, end: 2 }], policy, spoilerTerms).keywordHits, []);
+  // real package: Python masked the word, flags need a 5+ word note (short note -> Python refuses)
+  const ctx = await setup(t, { pkgArgs: ['--edit', 'clean', '--captions', 'what the fucking hell', '--caption-start', '3', '--caption-note', CAPTIONS_NOTE] });
+  const w = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'captions.words.json'), 'utf8'));
+  assert.deepEqual(w.map(x => x.word), ['what', 'the', 'f******', 'hell']);
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body)).status, 201);
+  assert.throws(() => makePackage(path.join(ctx.work, 'shortnote'), ['--edit', 'clean', '--captions', 'oh shit', '--caption-note', 'ok'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  assert.throws(() => makePackage(path.join(ctx.work, 'raw'), ['--edit', 'clean', '--captions', 'oh shit', '--raw-profanity'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+});
+
+test('2.7 fix 8: flash cut at most 1 per clip and intensity <= 0.5 (Node gate + Python export)', async t => {
+  assert.equal(FLASH_MAX_PER_CLIP, 1);
+  assert.equal(FLASH_MAX_INTENSITY, 0.5);
+  const base = { edit_choice: { by: 'S', edit_style: 'hype', effects: ['flash_cut'] }, render: { edit_style: 'hype', edit_effects: ['flash_cut'] } };
+  assert.deepEqual(renderEditProblems({ ...base, render: { ...base.render, flash_cuts: [10], flash_intensity: 0.5 } }), []);
+  assert.match(renderEditProblems({ ...base, render: { ...base.render, flash_cuts: [10, 20], flash_intensity: 0.5 } }).join(' '), /max 1 per clip/);
+  assert.match(renderEditProblems({ ...base, render: { ...base.render, flash_cuts: [10], flash_intensity: 0.85 } }).join(' '), /above 0.5/);
+  const ctx = await setup(t, { pkgArgs: ['--edit', 'hype', '--effects', 'flash_cut,end_fade', '--flash-cuts', '1'] });
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body)).status, 201);
+  assert.throws(() => makePackage(path.join(ctx.work, 'two'), ['--edit', 'hype', '--effects', 'flash_cut', '--flash-cuts', '2'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+});
+
+test('2.7 defaults: separate mic required (mixed track off unless opted in), game audio stripped unless opted in', async t => {
+  const { policy, spoilerTerms } = loadPolicy(TOOLS);
+  assert.equal(policy.mixed_track_path_enabled, false);
+  assert.equal(policy.game_audio_default, 'stripped');
+  assert.equal(policy.daily_upload_cap, 1);
+  assert.equal(policy.edit_policy.default_edit_style, 'clean');
+  assert.equal(mixedTrackAllowed({}, policy), false);
+  assert.equal(mixedTrackAllowed({ CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' }, policy), true);
+  const ctx = await setup(t);
+  const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
+  const opts = { env: ctx.env, policy, spoilerTerms, history: [] };
+  const mixed = { ...clip, commentary: { path: null, mic_source: null, tts_used: false, commentary_source: 'mixed_track_signed' },
+    render: { audio_mode: 'source', mic_source: null, music_volume: 1.0, captions: 'OFF' } };
+  assert.match(checkClipGates(mixed, opts).join(' '), /separate mic track required/);
+  assert.doesNotMatch(checkClipGates(mixed, { ...opts, env: { ...ctx.env, CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' } }).join(' '), /separate mic track required/);
+  const kept = { ...clip, render: { ...clip.render, audio_mode: 'mix', music_volume: 1.0 } };
+  assert.match(checkClipGates(kept, opts).join(' '), /--keep-game-audio opt-in/);
+  assert.doesNotMatch(checkClipGates({ ...kept, render: { ...kept.render, keep_game_audio_opt_in: true } }, opts).join(' '), /keep-game-audio/);
+  // Python refuses to export a mixed-track package without the opt-in
+  assert.throws(() => makePackage(path.join(ctx.work, 'mixedoff'), ['--mixed', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
 });

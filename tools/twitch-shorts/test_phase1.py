@@ -12,7 +12,7 @@ from unittest import mock
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
-os.environ.setdefault("CUTSCENECITY_EDIT_STYLE", "off")  # keep the suite fast; EditStage tests cover the hype default
+os.environ.setdefault("CUTSCENECITY_EDIT_STYLE", "off")  # phase 2.7 default is off anyway; EditStage tests cover it
 os.environ.setdefault("CUTSCENECITY_UPSCALE", "off")  # keep the suite fast; Upscale tests cover the 2160 default
 import compliance  # noqa: E402
 import gatelog  # noqa: E402
@@ -303,7 +303,8 @@ class CommentaryV3(unittest.TestCase):
     def test_rotation(self):
         pol = json.loads((HERE / "editorial-policy.json").read_text())
         c = tts_clip()
-        c["render"].update({"captions": "BURNED_IN_NEEDS_HUMAN_CHECK", "caption_style": "bold-white"})
+        c["render"].update({"captions": "BURNED_IN_NEEDS_HUMAN_CHECK", "caption_style": "bold-white",
+                            "caption_source": "mic_stream:1", "words_json_sha256": "a" * 64})
         self.assertEqual(compliance.rotation_gate(c, {"policy": pol, "previous_upload": None})[0], "PASS")
         prev = {"voice_preset": "charon-relaxed", "caption_style": "yellow-pop"}
         self.assertIn("voice preset charon-relaxed repeats", compliance.rotation_gate(c, {"policy": pol, "previous_upload": prev})[1])
@@ -339,8 +340,13 @@ class GameAudioDefault(unittest.TestCase):
         self.assertIn("[0:a]volume=0.35[s]", render.audio_filter("mix", "1:a", None, game_volume=0.35))
 
     def test_gates_not_loosened_for_kept_audio(self):
-        kept = {"audio_mode": "mix", "mic_source": "stream:1", "mic_gain": 1.0, "music_volume": 1.0, "captions": "OFF"}
+        kept = {"audio_mode": "mix", "mic_source": "stream:1", "mic_gain": 1.0, "music_volume": 1.0, "captions": "OFF",
+                "keep_game_audio_opt_in": True}
         self.assertEqual(compliance.live_reaction_gate(good_clip(render=kept), {})[0], "PASS")
+        no_opt_in = {**kept, "keep_game_audio_opt_in": False}                      # phase 2.7: keeping game audio is opt-in
+        self.assertIn("--keep-game-audio", compliance.live_reaction_gate(good_clip(render=no_opt_in), {})[1])
+        with self.assertRaisesRegex(ValueError, "stripped by default"):
+            render.render("/nonexistent.mp4", 0, 20, "/tmp", "x.mp4", audio_mode="mix", mic_stream=1)
         self.assertEqual(compliance.live_reaction_gate(good_clip(render={**kept, "mic_source": None}), {})[0], "FAIL")
         self.assertEqual(compliance.music_hint(good_clip(render=kept), {})[0], "FAIL")  # fingerprint still required
         c = good_clip(render=kept, fingerprint_precheck={"status": "NOT_INSTALLED"})
@@ -550,6 +556,7 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(pkg_dir.exists())
 
     def test_mixed_track_path_end_to_end(self):
+        os.environ["CUTSCENECITY_ALLOW_MIXED_TRACK"] = "true"   # opt-in (phase 2.7); restored by the setUp env patch
         m = self.pipeline()
         clip = m["clips"][0]
         self.assertEqual(clip["technical_qa"]["status"], "PASS_TECHNICAL_ONLY")          # qa.py ran at --render
@@ -601,8 +608,9 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
         clip = json.loads((pkg_dir / "clip.json").read_text())
         self.assertIs(clip["metadata"]["containsSyntheticMedia"], False)
-        self.assertEqual(clip["render"]["audio_mode"], "mix")  # default keeps original game audio
-        self.assertEqual((clip["render"]["game_audio"], clip["render"]["music_volume"]), ("kept", 1.0))
+        self.assertEqual(clip["render"]["audio_mode"], "mic_stem")  # phase 2.7: game audio stripped by default
+        self.assertEqual((clip["render"]["game_audio"], clip["render"]["music_volume"]), ("stripped (default)", None))
+        self.assertIs(clip["render"]["keep_game_audio_opt_in"], False)
 
 
     def test_paid_present_is_sent_true_and_tamper_blocks(self):
@@ -624,36 +632,24 @@ class EndToEnd(unittest.TestCase):
         upload_private.upload(pkg_dir, pkg["package_sha256"][:12], youtube=yt, media_factory=lambda p: p)
         self.assertEqual(yt.bodies[0]["paidProductPlacementDetails"], {"hasPaidProductPlacement": True})
 
-    def test_env_cap_cannot_exceed_two(self):
-        pkg_dir = self.approved_package()  # setUp sets CUTSCENECITY_DAILY_CAP=5
+    def test_env_cap_cannot_exceed_one(self):
+        pkg_dir = self.approved_package()  # setUp sets CUTSCENECITY_DAILY_CAP=5 -> clamps to the hard cap 1
         pkg = json.loads((pkg_dir / "package.json").read_text())
+        self.assertFalse(any("daily cap" in p for p in upload_private.verify_package(pkg_dir)[1]))  # 0 of 1 used
         gatelog.audit(status="ATTEMPT", package_sha256="x" * 64, file_sha256="y" * 64, vod_id="999", start_ms=0, end_ms=1)
-        self.assertFalse(any("daily cap" in p for p in upload_private.verify_package(pkg_dir)[1]))  # 1 of 2 used: still allowed
-        gatelog.audit(status="ATTEMPT", package_sha256="z" * 64, file_sha256="w" * 64, vod_id="998", start_ms=0, end_ms=1)
         problems = upload_private.verify_package(pkg_dir)[1]
-        self.assertTrue(any("daily cap reached: 2/2" in p for p in problems), problems)  # 3rd upload today blocked
+        self.assertTrue(any("daily cap reached: 1/1" in p for p in problems), problems)  # 2nd upload today blocked
         self.assertEqual(pkg["upload"]["paidProductPlacement"], False)
 
 
 class DailyCap(unittest.TestCase):
     def test_clamp_and_fail_closed(self):
         cap = gatelog.effective_daily_cap
-        self.assertEqual(gatelog.HARD_DAILY_CAP, 2)
-        self.assertEqual(cap("5", 1), 2)
-        self.assertEqual(cap("2", 1), 2)
-        self.assertEqual(cap(None, 2), 2)
-        self.assertEqual(cap(None, 10), 2)
-        self.assertEqual(cap("", 3), 2)
-        self.assertEqual(cap("1", None), 1)
-        self.assertEqual(cap("1", 2), 1)
-        self.assertEqual(cap("0", 1), 0)
-        self.assertEqual(cap("-3", 1), 0)
-        self.assertEqual(cap("abc", 1), 0)
-        self.assertEqual(cap("1.5", 1), 0)
-        self.assertEqual(cap(None, 0), 0)
-        self.assertEqual(cap(None, True), 0)
-        self.assertEqual(cap(None, None), 2)
-        self.assertEqual(cap(None, ""), 0)
+        self.assertEqual(gatelog.HARD_DAILY_CAP, 1)                         # phase 2.7: back from 2 to 1
+        for env, pol, want in (("5", 1, 1), ("2", 1, 1), (None, 2, 1), (None, 10, 1), ("", 3, 1), ("1", None, 1), ("1", 2, 1),
+                               ("0", 1, 0), ("-3", 1, 0), ("abc", 1, 0), ("1.5", 1, 0), (None, 0, 0), (None, True, 0),
+                               (None, None, 1), (None, "", 0)):
+            self.assertEqual(cap(env, pol), want, (env, pol))
 
     def test_zero_cap_blocks_upload(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CUTSCENECITY_STATE_DIR": d}):
@@ -663,22 +659,18 @@ class DailyCap(unittest.TestCase):
             self.assertEqual(gatelog.upload_blockers(pkg, 1), [])
             gatelog.audit(status="ATTEMPT", package_sha256="c" * 64, file_sha256="d" * 64, vod_id="2", start_ms=0, end_ms=1)
             self.assertTrue(any("1/1" in p for p in gatelog.upload_blockers(pkg, 1)))
-            self.assertEqual(gatelog.upload_blockers(pkg, 2), [])        # 2nd upload today allowed
-            self.assertEqual(gatelog.upload_blockers(pkg, 7), [])        # 7 clamps to 2
-            gatelog.audit(status="ATTEMPT", package_sha256="e" * 64, file_sha256="f" * 64, vod_id="3", start_ms=0, end_ms=1)
-            self.assertTrue(any("2/2" in p for p in gatelog.upload_blockers(pkg, 7)))   # 3rd blocked
-            self.assertTrue(any("2/2" in p for p in gatelog.upload_blockers(pkg, 2)))
+            self.assertTrue(any("1/1" in p for p in gatelog.upload_blockers(pkg, 2)))   # 2 clamps to 1
+            self.assertTrue(any("1/1" in p for p in gatelog.upload_blockers(pkg, 7)))   # 7 clamps to 1
 
     def test_day_boundary_is_ist(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"CUTSCENECITY_STATE_DIR": d}):
             pkg = {"package_sha256": "a" * 64, "file_sha256": "b" * 64, "source": {"vod_id": "1", "start_ms": 0, "end_ms": 10}}
-            for i in range(2):
-                gatelog.audit(status="ATTEMPT", package_sha256=str(i) * 64, file_sha256=str(i + 2) * 64, vod_id=f"9{i}", start_ms=0, end_ms=1)
+            gatelog.audit(status="ATTEMPT", package_sha256="0" * 64, file_sha256="2" * 64, vod_id="90", start_ms=0, end_ms=1)
             row = json.loads(gatelog.ledger_path().read_text().splitlines()[0])
             self.assertTrue(row["at"].endswith("+05:30"), row["at"])
             today = row["at"][:10]
-            self.assertTrue(any("2/2" in p for p in gatelog.upload_blockers(pkg, 2, today=today)))
-            self.assertEqual(gatelog.upload_blockers(pkg, 2, today="2099-01-01"), [])   # next IST day frees up
+            self.assertTrue(any("1/1" in p for p in gatelog.upload_blockers(pkg, 1, today=today)))
+            self.assertEqual(gatelog.upload_blockers(pkg, 1, today="2099-01-01"), [])   # next IST day frees up
 
 
 class PaidPromotion(unittest.TestCase):
@@ -748,9 +740,21 @@ def mixed_clip(**over):
 
 
 class MixedTrack(unittest.TestCase):
-    def setUp(self):
-        self.env = mock.patch.dict(os.environ, OWNER)
+    def setUp(self):   # phase 2.7: the mixed-track path is opt-in; these tests cover it with the opt-in set
+        self.env = mock.patch.dict(os.environ, {**OWNER, "CUTSCENECITY_ALLOW_MIXED_TRACK": "true"})
         self.env.start()
+
+    def test_mixed_track_off_by_default(self):
+        with mock.patch.dict(os.environ, {"CUTSCENECITY_ALLOW_MIXED_TRACK": ""}):
+            c = mixed_clip()
+            compliance.evaluate(c, {"policy": json.loads((HERE / "editorial-policy.json").read_text())})
+            for g in ("original_commentary", "live_reaction_preserved"):
+                self.assertEqual(c["compliance"][g]["status"], "FAIL", g)
+                self.assertIn("separate mic track required", c["compliance"][g]["evidence"])
+            self.assertEqual(c["compliance"]["mixed_track_commentary_confirmed"]["hint"], "FAIL")
+            with self.assertRaises(PermissionError):
+                compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
+            self.assertTrue(compliance.mixed_track_allowed({"policy": {"mixed_track_path_enabled": True}}))
 
     def tearDown(self):
         self.env.stop()
@@ -870,7 +874,10 @@ class Upscale(unittest.TestCase):
 class Defaults(unittest.TestCase):
     def test_policy_defaults(self):
         pol = json.loads((HERE / "editorial-policy.json").read_text())
-        self.assertEqual(pol["daily_upload_cap"], 2)
+        self.assertEqual(pol["daily_upload_cap"], 1)
+        self.assertEqual(pol["game_audio_default"], "stripped")
+        self.assertIs(pol["mixed_track_path_enabled"], False)
+        self.assertEqual(pol["edit_policy"]["default_edit_style"], "clean")
         self.assertEqual(pol["default_layout"], "blur")
         self.assertEqual(pol["source_policy"], "creator_owned_only")
         self.assertNotIn("source_vod", pol)
@@ -908,6 +915,8 @@ if __name__ == "__main__":
 
 
 import edit  # noqa: E402
+import edit_gates  # noqa: E402
+import overlay_scan  # noqa: E402
 import pipeline  # noqa: E402
 import qa  # noqa: E402
 
@@ -923,10 +932,13 @@ WORDS = [{"word": w, "start": 1.0 + i * 0.45, "end": 1.35 + i * 0.45}
 
 
 class EditStage(unittest.TestCase):
-    def test_default_is_hype_and_controls(self):
+    def test_default_is_clean_and_controls(self):          # phase 2.7: default per-clip choice clean, hype opt-in
+        self.assertEqual(edit.DEFAULT_EDIT_STYLE, "clean")
+        self.assertEqual(edit_gates.DEFAULT_CHOICE_STYLE, "clean")
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CUTSCENECITY_EDIT_STYLE", None)
-            self.assertEqual(edit.edit_style(), "hype")
+            self.assertEqual(edit.edit_style(), "clean")
+            self.assertEqual(edit.edit_style("none"), "off")
         with mock.patch.dict(os.environ, {"CUTSCENECITY_EDIT_STYLE": "clean"}):
             self.assertEqual(edit.edit_style(), "clean")
             self.assertEqual(edit.edit_style("off"), "off")              # flag beats env
@@ -959,8 +971,8 @@ class EditStage(unittest.TestCase):
         self.assertIn("zoompan=", g)
         self.assertIn("drawbox=x=0:y=ih-", g)
         self.assertIn("fade=t=out:st=29.700", g)
-        self.assertNotIn("color=white@0.85", g)                            # flash cut off by default
-        self.assertIn("color=white@0.85", edit.video_graph("hype", 30.0, p, None, joins=[15.0], flash=True))
+        self.assertNotIn("enable='between(t,", g)                           # flash cut off by default
+        self.assertIn("color=white@0.50", edit.video_graph("hype", 30.0, p, None, joins=[15.0], flash=True))
         self.assertEqual(edit.video_graph("clean", 30.0, p, "x.ass"), "[0:v]fps=30,setsar=1,ass=x.ass[v]")
         with self.assertRaises(ValueError):
             edit.video_graph("clean", 30.0, [], "x';evil.ass")
@@ -976,21 +988,273 @@ class EditStage(unittest.TestCase):
 
     @unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
     def test_render_hype_then_upscale_audio_unchanged(self):
+        choice = {"edit_style": "hype", "effects": list(edit_gates.EFFECTS[:-1]), "by": "Shebin"}
         with tempfile.TemporaryDirectory() as d:
             d = pathlib.Path(d)
             vod = d / "vod.mp4"
-            make_vod(vod, seconds=50)          # loud burst at 40-46 s
-            with mock.patch.object(edit, "transcribe_words", return_value=WORDS):
-                hype = render.render(vod, 28, 48, d, "hype.mp4", layout="blur", edit_style="hype", upscale="1440")
-            plain = render.render(vod, 28, 48, d, "plain.mp4", layout="blur", edit_style="off", upscale="1440")
+            make_vod(vod, seconds=50)          # loud burst at 40-46 s; 0:a:1 = mic stem
+            with mock.patch.object(edit, "transcribe_words", return_value=WORDS) as tw:
+                hype = render.render(vod, 28, 48, d, "hype.mp4", layout="blur", audio_mode="mix", mic_stream=1, keep_game_audio=True,
+                                     edit_choice=choice, upscale="1440")
+            self.assertEqual(tw.call_args.kwargs["stream"], "0:a:1")                    # captions from the MIC stem only
+            self.assertEqual(tw.call_args.kwargs["start"], 28)
+            plain = render.render(vod, 28, 48, d, "plain.mp4", layout="blur", audio_mode="mix", mic_stream=1, keep_game_audio=True,
+                                  upscale="1440")
             self.assertEqual(audio_md5(d / "hype.mp4"), audio_md5(d / "plain.mp4"))     # edit + upscale never touch audio
             self.assertEqual(render.video_size(d / "hype.mp4"), (1440, 2560))           # edit ran before upscale
-            self.assertEqual((hype["edit_style"], hype["upscale"]), ("hype", "1440"))
+            self.assertEqual(render.video_size(d / "hype.preedit.mp4"), (1080, 1920))   # pre-edit copy kept for the scan
+            self.assertEqual(hype["pre_edit_sha256"], edit_gates.sha256_bytes(d / "hype.preedit.mp4"))
+            self.assertEqual((hype["edit_style"], hype["upscale"], hype["edit_choice_by"]), ("hype", "1440", "Shebin"))
             self.assertEqual(hype["captions"], "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK")
+            self.assertEqual(hype["caption_source"], "mic_stream:1")
             self.assertEqual(hype["caption_style"], "word-pop-yellow")
+            self.assertEqual(hype["words_json_sha256"], edit_gates.sha256_bytes(d / "hype.words.json"))
             self.assertGreaterEqual(hype["zoom_count"], 1)
             self.assertLessEqual(hype["zoom_count"], int(20 / edit.MIN_GAP) + 1)
+            self.assertEqual(hype["flash_cuts"], [])
             self.assertEqual(edit.ass_words((d / "hype.words.ass").read_text()), [w["word"] for w in WORDS])
             self.assertEqual(qa.validate(d / "hype.mp4", 28, 48)["status"], "PASS_TECHNICAL_ONLY")
             self.assertEqual(plain["edit_style"], "off")
             self.assertNotIn("zoom_count", plain)
+            self.assertFalse((d / "plain.preedit.mp4").exists())
+
+
+class Phase27Compliance(unittest.TestCase):
+    """Compliance fixes for the 2.6 edit stage (coordinator relay, phase 2.7)."""
+
+    def test_fix1_default_off_and_hype_needs_explicit_choice(self):
+        pol = json.loads((HERE / "editorial-policy.json").read_text())
+        self.assertEqual(pol["edit_policy"]["default_edit_style"], "clean")    # replaced fix 1's "off" (defaults commit)
+        with mock.patch.dict(os.environ, {"CUTSCENECITY_EDIT_STYLE": "hype"}):
+            with self.assertRaisesRegex(ValueError, "recorded per-clip human edit choice"):
+                render.render("/nonexistent.mp4", 0, 20, "/tmp", "x.mp4")           # env alone never applies edits
+
+    def test_fix2_captions_only_from_mic_stem(self):
+        self.assertIsNone(edit_gates.caption_source({"audio_mode": "source"}))         # Twitch VOD mixed track
+        self.assertIsNone(edit_gates.caption_source({"audio_mode": "mix"}))
+        self.assertEqual(edit_gates.caption_source({"audio_mode": "mix", "mic_stream": 1})["stream"], "0:a:1")
+        self.assertEqual(edit_gates.caption_source({"audio_mode": "mic_stem", "mic": "/x/mic.wav"})["label"], "mic_file:mic.wav")
+        choice = {"edit_style": "clean", "effects": ["captions"], "by": "Shebin"}
+        with self.assertRaisesRegex(edit_gates.CaptionSourceError, "separate creator mic stem"):
+            render.render("/nonexistent.mp4", 0, 20, "/tmp", "x.mp4", audio_mode="source", edit_choice=choice)
+        with self.assertRaises(edit_gates.CaptionSourceError):
+            edit.apply("/nonexistent.mp4", choice, caption_source=None)
+        with self.assertRaises(edit_gates.CaptionSourceError):                         # old SRT path removed
+            render.render("/nonexistent.mp4", 0, 20, "/tmp", "x.mp4", captions=True)
+        args = mock.Mock(captions=True, edit_style=None, caption_style=None, flash_cut=False)
+        self.assertIn("mic stem", pipeline.pre_edit_refusal(args))
+        c = good_clip(render={"audio_mode": "source", "captions": "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK",
+                              "caption_source": "mixed_track", "words_json_sha256": "a" * 64})
+        self.assertEqual(compliance.captions_hint(c, {})[0], "FAIL")
+        self.assertIn("mic stem", " ".join(edit_gates.render_edit_problems(c)))
+
+    def test_fix3_captions_reviewed_required_and_bound_to_words_json(self):
+        burned = {"audio_mode": "mic_stem", "mic_source": "stream:1", "mic_gain": 1.0, "captions": "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK",
+                  "caption_source": "mic_stream:1", "caption_style": "word-pop-yellow"}
+        self.assertNotIn("captions_reviewed", compliance.required_human_checks(good_clip()))
+        c = good_clip(render=dict(burned))
+        self.assertIn("captions_reviewed", compliance.required_human_checks(c))
+        self.assertEqual(compliance.captions_hint(c, {})[0], "FAIL")                    # no words.json hash
+        with tempfile.TemporaryDirectory() as d:
+            wp = pathlib.Path(d) / "short_01.words.json"
+            wp.write_text(json.dumps([{"word": "nice", "start": 12.0, "end": 12.3}]))
+            sha = edit_gates.sha256_bytes(wp)
+            c = good_clip(render={**burned, "words_json": wp.name, "words_json_sha256": sha})
+            self.assertIn("captions_reviewed: no signed caption review", " ".join(edit_gates.signed_problems(c, [], "f" * 64, wp)))
+            so = {"action": "signoff", "check": "captions_reviewed", "clip": "short_01.mp4", "file_sha256": "f" * 64,
+                  "words_json_sha256": sha, "note": "read every caption word against the video"}
+            self.assertEqual(edit_gates.signed_problems(c, [so], "f" * 64, wp), [])
+            self.assertTrue(edit_gates.signed_problems(c, [so], "e" * 64, wp))         # other file
+            wp.write_text(json.dumps([{"word": "Lucia", "start": 12.0, "end": 12.3}]))
+            probs = " ".join(edit_gates.signed_problems(c, [so], "f" * 64, wp))
+            self.assertIn("words.json changed after render", probs)
+            self.assertIn("no signed caption review for this exact words.json", probs)
+
+    def test_fix4_profanity_masked_and_first_10s_flagged(self):
+        self.assertEqual(edit_gates.mask_word("fucking!"), "f******!")
+        self.assertEqual(edit_gates.mask_word("Shit"), "S***")
+        words = [{"word": w, "start": t, "end": t + 0.3} for w, t in
+                 (("What", 1.0), ("the", 1.4), ("FUCK?", 1.8), ("nice", 5.0), ("shitty", 12.0), ("bastard", 14.0), ("classic", 15.0))]
+        masked = edit_gates.mask_words(words)
+        self.assertEqual([w["word"] for w in masked], ["What", "the", "F***?", "nice", "s*****", "b******", "classic"])
+        self.assertTrue(masked[2]["masked"])
+        self.assertNotIn("masked", masked[0])
+        flags = edit_gates.caption_flags(masked)
+        self.assertEqual((flags["profanity_masked"], flags["profanity_first_10s"], flags["unmasked_profanity"]), (3, [1.8], []))
+        self.assertIs(flags["audio_bleeped"], False)
+        self.assertTrue(any("first 10 s" in r for r in edit_gates.flag_reasons(flags)))
+        self.assertTrue(any("NOT bleeped" in r for r in edit_gates.flag_reasons(flags)))
+        self.assertEqual(edit_gates.caption_flags(words)["unmasked_profanity"], [1.8, 12.0, 14.0])
+        ass = edit.build_ass(masked, 20.0)
+        self.assertNotIn("FUCK", ass)
+        self.assertIn("F***?", ass)
+        c = good_clip(render={"audio_mode": "mic_stem", "captions": "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK", "caption_source": "mic_stream:1",
+                              "words_json_sha256": "a" * 64, "caption_review": flags})
+        self.assertEqual(compliance.captions_hint(c, {})[0], "WARN")                    # note required
+        pol = json.loads((HERE / "editorial-policy.json").read_text())
+        self.assertIs(pol["caption_policy"]["audio_bleep"], False)
+        self.assertIn("NOT bleeped", pol["caption_policy"]["audio_bleep_note"])
+
+    def test_fix5_story_names_and_plot_keywords_flagged(self):
+        pol = json.loads((HERE / "editorial-policy.json").read_text())
+        cp = pol["caption_policy"]
+        self.assertTrue({"Lucia", "Jason"} <= set(cp["story_names"]))
+        self.assertTrue(any(n.startswith("PLACEHOLDER") for n in cp["story_names"]))
+        self.assertIn("PLACEHOLDER", cp["keyword_list_status"])
+        words = [{"word": w, "start": float(i), "end": i + 0.4} for i, w in
+                 enumerate("Jason, that was the final mission? PLACEHOLDER_STORY_NAME_1 lucia".split())]
+        hits = edit_gates.keyword_hits(words)
+        self.assertEqual(sorted(h["term"] for h in hits), ["Jason", "Lucia", "final mission"])
+        self.assertEqual([h["t"] for h in hits if h["term"] == "final mission"], [4.0])
+        flags = edit_gates.caption_flags(words)
+        self.assertTrue(flags["keyword_list_incomplete"])
+        self.assertTrue(any("story name / plot keyword" in r for r in edit_gates.flag_reasons(flags)))
+        terms, incomplete = edit_gates.keyword_terms({"caption_policy": {"story_names": ["Lucia"], "plot_keywords": []}})
+        self.assertFalse(incomplete)
+        self.assertIn("Lucia", terms)
+        self.assertIn("twist", terms)                                                   # shared spoiler list too
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
+    def test_fix6_overlay_scan_ignores_our_captions(self):
+        import cv2
+        import numpy as np
+        rng = np.random.default_rng(1)
+        frames = []
+        for _ in range(8):
+            f = rng.integers(0, 255, (1920, 1080, 3), dtype=np.uint8)               # moving "gameplay"
+            f[int(1920 * 0.70):int(1920 * 0.80), :] = 0                               # static caption-like text block
+            for y in range(int(1920 * 0.71), int(1920 * 0.80), 28):
+                cv2.putText(f, "WATCH OUT BRO WATCH OUT BRO", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+            frames.append(f)
+        self.assertTrue(overlay_scan.edge_cells([x.copy() for x in frames]))
+        masked = overlay_scan.mask([x.copy() for x in frames], [edit.CAPTION_BAND, edit.PROGRESS_BAND])
+        self.assertEqual(overlay_scan.edge_cells(masked), [])
+        # precheck prefers the pre-edit render, bound to the final file hash
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            (root / "short_01.mp4").write_bytes(b"final")
+            (root / "short_01.preedit.mp4").write_bytes(b"pre")
+            c = {"file": "short_01.mp4", "render": {"edit_style": "clean", "captions": "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK",
+                                                   "pre_edit_file": "short_01.preedit.mp4",
+                                                   "pre_edit_sha256": edit_gates.sha256_bytes(root / "short_01.preedit.mp4")}}
+            with mock.patch.object(overlay_scan, "scan", return_value={"flagged": False}) as sc:
+                res = review.overlay_precheck(root, c)
+            self.assertEqual(sc.call_args.args[0], root / "short_01.preedit.mp4")
+            self.assertEqual(sc.call_args.args[1], gatelog.sha256_file(root / "short_01.mp4"))
+            self.assertEqual(res["scanned"], "pre_edit")
+            (root / "short_01.preedit.mp4").write_bytes(b"stale")                     # pre-edit no longer matches
+            with mock.patch.object(overlay_scan, "scan", return_value={"flagged": False}) as sc:
+                res = review.overlay_precheck(root, c)
+            self.assertEqual(sc.call_args.args[0], root / "short_01.mp4")
+            self.assertEqual(sc.call_args.kwargs["mask_bands"], [edit.CAPTION_BAND, edit.PROGRESS_BAND])
+            self.assertEqual(res["scanned"], "final_caption_band_masked")
+
+    def test_fix7_edit_choice_is_per_clip_human_and_enforced(self):
+        with self.assertRaisesRegex(ValueError, "reviewer name"):
+            edit_gates.validate_choice({"edit_style": "hype", "effects": ["punch_in"]})
+        with self.assertRaisesRegex(ValueError, "not allowed for edit style clean"):
+            edit_gates.validate_choice({"edit_style": "clean", "effects": ["punch_in"], "by": "Shebin"})
+        with self.assertRaisesRegex(ValueError, "explicit list"):
+            edit_gates.validate_choice({"edit_style": "hype", "by": "Shebin"})
+        with self.assertRaises(ValueError):
+            edit_gates.parse_effects(None)
+        self.assertEqual(edit_gates.parse_effects("none"), [])
+        ok = edit_gates.validate_choice({"edit_style": "hype", "effects": ["end_fade", "punch_in"], "by": "Shebin"})
+        self.assertEqual(ok["effects"], ["punch_in", "end_fade"])
+        with self.assertRaisesRegex(ValueError, "no per-clip human edit choice"):
+            edit.apply("/nonexistent.mp4", None)
+        g = edit.video_graph("hype", 30.0, [{"t": 5.0, "shake": True}], None, effects=["end_fade"])
+        self.assertNotIn("zoompan", g)                                                 # only the chosen effects
+        self.assertNotIn("drawbox=x=0:y=ih-", g)
+        self.assertIn("fade=t=out", g)
+        args = mock.Mock(captions=False, edit_style="hype", caption_style=None, flash_cut=False)
+        self.assertIn("review.py edit", pipeline.pre_edit_refusal(args))
+        self.assertIsNone(pipeline.pre_edit_refusal(mock.Mock(captions=False, edit_style=None, caption_style=None, flash_cut=False)))
+        c = good_clip(render={"audio_mode": "mic_stem", "mic_source": "stream:1", "mic_gain": 1.0, "captions": "OFF",
+                              "edit_style": "hype", "edit_effects": ["punch_in"]})
+        pol = json.loads((HERE / "editorial-policy.json").read_text())
+        self.assertIn("without a recorded human edit choice", compliance.rotation_gate(c, {"policy": pol})[1])
+        c["edit_choice"] = {"edit_style": "hype", "effects": ["punch_in", "shake"], "by": "Shebin", "flash_intensity_pct": 0}
+        self.assertIn("differ from the recorded", compliance.rotation_gate(c, {"policy": pol})[1])
+        c["edit_choice"]["effects"] = ["punch_in"]
+        self.assertEqual(compliance.rotation_gate(c, {"policy": pol})[0], "PASS")
+        self.assertIn("no signed per-clip human edit choice", " ".join(edit_gates.signed_problems(c, [], "f" * 64, None)))
+        e = {"action": "edit_choice", "clip": "short_01.mp4", "edit_style": "hype", "effects": ["punch_in"], "by": "Shebin",
+             "flash_intensity_pct": 0}
+        self.assertEqual(edit_gates.signed_problems(c, [e], "f" * 64, None), [])
+
+    def test_fix8_flash_off_by_default_max_one_and_half_intensity(self):
+        self.assertEqual((edit_gates.FLASH_MAX_PER_CLIP, edit_gates.FLASH_MAX_INTENSITY), (1, 0.5))
+        self.assertEqual(edit_gates.flash_plan([10.0, 20.0], False), [])                # off by default
+        self.assertEqual(edit_gates.flash_plan([10.0, 20.0, 30.0], True), [10.0])       # at most 1 per clip
+        with self.assertRaises(ValueError):
+            edit_gates.flash_plan([10.0], True, 0.85)
+        g = edit.video_graph("hype", 60.0, [], None, joins=[10.0, 20.0, 30.0], flash=True)
+        self.assertEqual(g.count("enable='between(t,"), 1)
+        self.assertIn("color=white@0.50", g)
+        self.assertEqual(edit.video_graph("hype", 60.0, [], None, joins=[10.0], flash=False).count("enable='between(t,"), 0)
+        with self.assertRaises(ValueError):
+            edit.video_graph("hype", 60.0, [], None, joins=[10.0], flash=True, flash_intensity=0.6)
+        self.assertEqual(edit.video_graph("clean", 60.0, [], None, joins=[10.0], flash=True).count("enable='between(t,"), 0)
+        with self.assertRaisesRegex(ValueError, "flash intensity"):
+            edit_gates.validate_choice({"edit_style": "hype", "effects": ["flash_cut"], "by": "S", "flash_intensity_pct": 60})
+        self.assertEqual(edit_gates.validate_choice({"edit_style": "hype", "effects": ["flash_cut"], "by": "S"})["flash_intensity_pct"], 50)
+        c = good_clip(render={"audio_mode": "mic_stem", "mic_source": "stream:1", "mic_gain": 1.0, "captions": "OFF",
+                              "edit_style": "hype", "edit_effects": ["flash_cut"], "flash_cuts": [10.0, 20.0], "flash_intensity": 0.85},
+                      edit_choice={"edit_style": "hype", "effects": ["flash_cut"], "by": "S"})
+        probs = " ".join(edit_gates.render_edit_problems(c))
+        self.assertIn("max 1 per clip", probs)
+        self.assertIn("above 0.5", probs)
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
+class Phase27EndToEnd(unittest.TestCase):
+    """review.py edit -> captions_reviewed -> approve/export -> upload_private.verify_package (real ffmpeg, whisper mocked)."""
+    setUpClass, tearDownClass = EndToEnd.__dict__["setUpClass"], EndToEnd.__dict__["tearDownClass"]
+    setUp, tearDown, pipeline, rv = EndToEnd.setUp, EndToEnd.tearDown, EndToEnd.pipeline, EndToEnd.rv
+
+    def test_edit_captions_review_export(self):
+        words = [{"word": w, "start": 2.0 + i * 0.5, "end": 2.4 + i * 0.5} for i, w in enumerate("oh shit he is flanking left".split())]
+        self.pipeline("--layout", "blur")
+        details = self.d / "details.json"
+        details.write_text(json.dumps({"metadata": {"title": "Flanked on the docks", "privacyStatus": "private", "tags": ["gta"],
+                                                    "containsSyntheticMedia": False,
+                                                    "description": "Clip from CutsceneCity: https://www.twitch.tv/videos/1234567890"},
+                                       "transformation_note": " ".join(["commentary"] * 30)}))
+        self.rv("set", "--file", str(details), "--by", "Shebin")
+        with self.assertRaisesRegex(SystemExit, "mic stem"):                           # pipeline clip = mixed track only
+            self.rv("edit", "--style", "clean", "--effects", "captions", "--by", "Shebin")
+        self.rv("commentary", "--mic-stream", "1")
+        c0 = json.loads((self.root / "manifest.json").read_text())["clips"][0]
+        self.assertEqual(c0["render"]["audio_mode"], "mic_stem")                    # game audio stripped by default
+        with self.assertRaisesRegex(SystemExit, "--by is required"):
+            self.rv("edit", "--style", "hype", "--effects", "punch_in")
+        with self.assertRaisesRegex(SystemExit, "flash intensity"):
+            self.rv("edit", "--style", "hype", "--effects", "flash_cut", "--flash-intensity", "0.8", "--by", "Shebin")
+        with mock.patch.object(edit, "transcribe_words", return_value=words) as tw:
+            self.rv("edit", "--by", "Shebin")                                       # default choice: clean + captions
+        self.assertEqual(tw.call_args.kwargs["stream"], "0:a:1")
+        c = json.loads((self.root / "manifest.json").read_text())["clips"][0]
+        self.assertEqual((c["render"]["edit_style"], c["render"]["edit_effects"], c["edit_choice"]["by"]), ("clean", ["captions"], "Shebin"))
+        wj = json.loads((self.root / c["render"]["words_json"]).read_text())
+        self.assertEqual([w["word"] for w in wj], ["oh", "s***", "he", "is", "flanking", "left"])
+        self.assertEqual(c["render"]["caption_review"]["profanity_first_10s"], [2.5])
+        self.rv("precheck")
+        c = json.loads((self.root / "manifest.json").read_text())["clips"][0]
+        self.assertEqual(c["overlay_scan"]["scanned"], "pre_edit")
+        self.assertEqual(c["overlay_scan"]["file_sha256"], gatelog.sha256_file(self.root / "short_01.mp4"))
+        for check in ("vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared", "overlays_third_parties_cleared"):
+            self.rv("signoff", "--check", check, "--by", "Shebin", "--note", "watched the full clip twice, gameplay only")
+        self.rv("paid", "--value", "none", "--by", "Shebin")
+        with self.assertRaisesRegex(SystemExit, "captions_reviewed"):
+            self.rv("approve", "--by", "Shebin")
+        with self.assertRaisesRegex(SystemExit, r"5\+ words"):                        # flagged: profanity in the first 10 s
+            self.rv("signoff", "--check", "captions_reviewed", "--by", "Shebin", "--note", "fine")
+        self.rv("signoff", "--check", "captions_reviewed", "--by", "Shebin", "--note", "read all captions; masked swear is ok")
+        self.rv("approve", "--by", "Shebin")
+        self.rv("export", "--packages", str(self.d / "packages"))
+        pkg_dir = next((self.d / "packages").iterdir())
+        self.assertTrue((pkg_dir / "captions.words.json").exists())
+        self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
+        (pkg_dir / "captions.words.json").write_text(json.dumps(wj[:3]))
+        self.assertTrue(any("words.json" in p for p in upload_private.verify_package(pkg_dir)[1]))

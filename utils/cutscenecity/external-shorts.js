@@ -14,7 +14,8 @@
  *                                 ("cutscenecity"); if both are empty everything is blocked
  *   CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY  default true (TTS counts toward 60% only with the AI disclosure)
  *   CUTSCENECITY_STATE_DIR        shared upload audit ledger (default ~/.cutscenecity)
- *   CUTSCENECITY_DAILY_CAP        overrides editorial-policy.json daily_upload_cap; clamped to max 2, <=0 or invalid = blocked; counted per IST day
+ *   CUTSCENECITY_DAILY_CAP        overrides editorial-policy.json daily_upload_cap; clamped to max 1, <=0 or invalid = blocked; counted per IST day
+ *   CUTSCENECITY_ALLOW_MIXED_TRACK  phase 2.7: mixed-track path (no separate mic) is OFF unless true (or policy mixed_track_path_enabled)
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -24,10 +25,86 @@ const path = require('path');
 const TOOLS_DIR = path.join(__dirname, '..', '..', 'tools', 'twitch-shorts');
 const SIM = { flagAt: 0.40, rejectAbove: 0.50, nearLine: 0.80, history: 30, shingle: 3 };
 const REQUIRED_HUMAN_CHECKS = ['vod_rights_confirmed', 'no_story_cutscene', 'music_risk_cleared', 'overlays_third_parties_cleared'];
-const HARD_DAILY_CAP = 2; // raised from 1 in Phase 2.5; day boundary = IST (UTC+05:30)
+const HARD_DAILY_CAP = 1; // phase 2.7 (Compliance): back from 2 to 1; day boundary = IST (UTC+05:30)
+const mixedTrackAllowed = (env, policy) => ['1', 'true', 'yes', 'on'].includes(String((env || {}).CUTSCENECITY_ALLOW_MIXED_TRACK || '').trim().toLowerCase()) ||
+  Boolean((policy || {}).mixed_track_path_enabled);
 const ALLOWED_RESOLUTIONS = ['1080x1920', '1440x2560', '2160x3840'];
 const PAID_VALUES = ['none', 'present'];
 const YT_PART = 'snippet,status,paidProductPlacementDetails';
+// Phase 2.7 (Compliance): same rules as tools/twitch-shorts/edit_gates.py, re-checked independently here.
+const STYLE_EFFECTS = {
+  off: [], clean: ['captions'], hype: ['captions', 'punch_in', 'shake', 'hook_zoom', 'end_fade', 'progress_bar', 'flash_cut']
+};
+const FLASH_MAX_PER_CLIP = 1;
+const FLASH_MAX_INTENSITY = 0.5;
+const WORDS_PACKAGE_NAME = 'captions.words.json';
+const noteWords = n => String(n || '').split(/\s+/).filter(Boolean).length;
+const normTok = t => String(t).toLowerCase().replace(/[^a-z0-9']/g, '');
+const captionsBurned = r => String((r || {}).captions || 'OFF').startsWith('BURNED');
+
+function isProfane(word, terms) {
+  const n = normTok(word).replace(/'/g, '');
+  return Boolean(n) && terms.some(t => n.startsWith(t));
+}
+
+/** Review flags for captions_reviewed, recomputed from the package words.json (never trusts the manifest). */
+function captionFlags(words, policy, spoilerTerms = []) {
+  const cp = (policy || {}).caption_policy || {};
+  const terms = (cp.profanity_terms || []).map(t => String(t).toLowerCase()).filter(Boolean);
+  const first = cp.profanity_warn_first_seconds ?? 10;
+  const raw = [...(cp.story_names || []), ...(cp.plot_keywords || [])].map(t => String(t).trim());
+  const incomplete = raw.some(t => t.toLowerCase().startsWith('placeholder'));
+  const kw = [...raw.filter(t => t && !t.toLowerCase().startsWith('placeholder')), ...spoilerTerms];
+  const toks = words.map(w => normTok(w.word));
+  const hits = [];
+  for (const term of kw) {
+    const parts = term.split(/\s+/).map(normTok).filter(Boolean);
+    if (!parts.length) continue;
+    for (let i = 0; i + parts.length <= toks.length; i += 1) {
+      if (parts.every((p, k) => toks[i + k] === p)) hits.push({ term, t: words[i].start });
+    }
+  }
+  const masked = words.filter(w => w.masked);
+  return {
+    profanityMasked: masked.length,
+    profanityFirst10s: masked.filter(w => Number(w.start) < first).map(w => w.start),
+    unmaskedProfanity: words.filter(w => !w.masked && isProfane(w.word, terms)).map(w => w.start),
+    keywordHits: hits,
+    keywordListIncomplete: incomplete
+  };
+}
+
+const captionFlagged = f => Boolean(f.profanityFirst10s.length || f.keywordHits.length || f.keywordListIncomplete || f.profanityMasked);
+
+/** Render vs recorded human edit choice, flash limits, mic-stem-only captions (manifest consistency). */
+function renderEditProblems(clip) {
+  const r = clip.render || {};
+  const ec = clip.edit_choice || {};
+  const style = r.edit_style || 'off';
+  const p = [];
+  if (!Object.prototype.hasOwnProperty.call(STYLE_EFFECTS, style)) p.push(`edit style ${style} is not off, clean or hype`);
+  if (style !== 'off' || (r.edit_effects || []).length) {
+    if (!ec.by) p.push(`edit style ${style} was applied without a recorded human edit choice`);
+    else if (ec.edit_style !== style || JSON.stringify(ec.effects || []) !== JSON.stringify(r.edit_effects || [])) {
+      p.push('render edit style/effects differ from the recorded human edit choice');
+    }
+    const allowed = STYLE_EFFECTS[style] || [];
+    const bad = (r.edit_effects || []).filter(e => !allowed.includes(e));
+    if (bad.length) p.push(`effects ${bad.join(', ')} are not allowed for edit style ${style}`);
+  }
+  const flashes = r.flash_cuts || [];
+  if (flashes.length > FLASH_MAX_PER_CLIP) p.push(`${flashes.length} flash cuts (max ${FLASH_MAX_PER_CLIP} per clip)`);
+  if (flashes.length && !(Number(r.flash_intensity) > 0 && Number(r.flash_intensity) <= FLASH_MAX_INTENSITY)) {
+    p.push(`flash intensity ${r.flash_intensity} above ${FLASH_MAX_INTENSITY}`);
+  }
+  if (captionsBurned(r)) {
+    if (!String(r.caption_source || '').startsWith('mic_') || isMixedTrack(clip)) {
+      p.push('captions were not generated from a separate mic stem (mixed/game track captions are refused)');
+    }
+    if (!HEX64.test(r.words_json_sha256 || '')) p.push('burned captions have no words.json hash to review');
+  }
+  return p;
+}
 
 /** min(env or policy, 2); 0, negative or unparseable = 0 (blocked). Same rule as gatelog.effective_daily_cap. */
 function effectiveDailyCap(envValue, policyValue) {
@@ -224,6 +301,7 @@ function checkClipGates(clip, { env, policy, spoilerTerms, history = [], previou
   const mixed = isMixedTrack(clip);
   if (mixed) {
     // Mixed-track path (single Twitch VOD track): creator-owned only, kept at full level, and a signed human confirmation.
+    if (!mixedTrackAllowed(env, policy)) p.push('mixed track: separate mic track required; the mixed-track path is off by default (opt-in CUTSCENECITY_ALLOW_MIXED_TRACK=true)');
     if (!own) p.push('mixed track: only creator-owned VODs may use the mixed-track path');
     if ((r.audio_mode || 'source') !== 'source' || Number(r.music_volume ?? 1) !== 1) p.push('mixed track must be kept unchanged at full level');
     const conf = (clip.compliance || {}).mixed_track_commentary_confirmed || {};
@@ -232,6 +310,7 @@ function checkClipGates(clip, { env, policy, spoilerTerms, history = [], previou
     }
   } else {
     if (!['mix', 'mic_stem'].includes(r.audio_mode) || !r.mic_source || r.mic_gain !== 1) p.push('live reaction: creator mic stem must be in the mix at full level (no mute/duck)');
+    if (r.audio_mode === 'mix' && r.keep_game_audio_opt_in !== true) p.push('game audio kept without the --keep-game-audio opt-in (stripped by default)');
     const runtime = Number(clip.end) - Number(clip.start);
     const min = Math.max(0.6, Number(policy.min_commentary_coverage) || 0.6);
     const speech = Number((ttsCounts(env) ? c.speech_seconds_combined : c.speech_seconds_live) || 0);
@@ -256,6 +335,7 @@ function checkClipGates(clip, { env, policy, spoilerTerms, history = [], previou
     if (!styles.includes(r.caption_style)) p.push(`caption style ${r.caption_style} not in policy`);
     else if (previous && previous.caption_style === r.caption_style) p.push(`caption style ${r.caption_style} repeats the previous upload`);
   }
+  p.push(...renderEditProblems(clip));
   if (String(clip.transformation_note || '').split(/\s+/).filter(Boolean).length < 25) p.push('transformation note needs 25+ words');
   if ((clip.technical_qa || {}).status !== 'PASS_TECHNICAL_ONLY') p.push('technical QA has not passed');
   const comp = clip.compliance || {};
@@ -419,6 +499,31 @@ class ExternalShortsService {
       const so = entries.filter(e => e.action === 'signoff' && e.check === 'mixed_track_commentary_confirmed' && e.clip === pkg.clip && e.file_sha256 === fileSha).pop();
       if (so && String(so.note || '').split(/\s+/).filter(Boolean).length < 5) p.push('mixed_track_commentary_confirmed: signed note must have 5+ words');
     }
+    // Phase 2.7: signed per-clip edit choice, and captions_reviewed bound to the exact words.json + file.
+    const r = clip.render || {};
+    if ((r.edit_style || 'off') !== 'off') {
+      const ec = clip.edit_choice || {};
+      const so = entries.filter(e => e.action === 'edit_choice' && e.clip === pkg.clip).pop();
+      if (!so) p.push('edit_choice: no signed per-clip human edit choice');
+      else if (so.edit_style !== ec.edit_style || JSON.stringify(so.effects) !== JSON.stringify(ec.effects) ||
+               so.flash_intensity_pct !== ec.flash_intensity_pct || so.by !== ec.by) p.push('edit_choice: manifest choice differs from the signed choice');
+    }
+    if (captionsBurned(r)) {
+      humanChecks.push('captions_reviewed');
+      const wordsFile = path.join(pkgDir, WORDS_PACKAGE_NAME);
+      if (!fs.existsSync(wordsFile)) p.push('captions_reviewed: words.json missing from the package');
+      else {
+        const wsha = await sha256File(wordsFile);
+        if (wsha !== r.words_json_sha256 || wsha !== (pkg.captions || {}).words_json_sha256) p.push('captions_reviewed: words.json changed after render/export');
+        const so = entries.filter(e => e.action === 'signoff' && e.check === 'captions_reviewed' && e.clip === pkg.clip && e.file_sha256 === fileSha).pop();
+        if (!so || so.words_json_sha256 !== wsha) p.push('captions_reviewed: no signed caption review for this exact words.json + file');
+        let words = [];
+        try { words = JSON.parse(fs.readFileSync(wordsFile, 'utf8')); } catch (_e) { p.push('captions_reviewed: words.json is not valid JSON'); }
+        const flags = captionFlags(Array.isArray(words) ? words : [], policy, spoilerTerms);
+        if (flags.unmaskedProfanity.length) p.push('captions contain unmasked strong profanity');
+        if (so && captionFlagged(flags) && noteWords(so.note) < 5) p.push('captions_reviewed: flagged captions need a 5+ word reviewer note');
+      }
+    }
     const signed = new Set(entries.filter(e => e.action === 'signoff' && e.clip === pkg.clip && e.file_sha256 === fileSha).map(e => e.check));
     humanChecks.filter(n => !signed.has(n)).forEach(n => p.push(`${n}: no signed human sign-off for this file`));
     p.push(...checkClipGates(clip, { env: this.env, policy, spoilerTerms, history: this.readHistory(), previous: this.previousUpload(pkg.package_sha256) }));
@@ -521,4 +626,4 @@ function registerExternalShortsRoutes(app, getService, { env = process.env } = {
   });
 }
 
-module.exports = { ExternalShortsService, isMixedTrack, checkClipGates, loadPolicy, ownerMatch, checkScript, clipKey, effectiveDailyCap, REQUIRED_HUMAN_CHECKS, registerExternalShortsRoutes, canonicalJson, sha256Json, signEntry, verifyReviewLog, validateImport, GateError };
+module.exports = { mixedTrackAllowed, HARD_DAILY_CAP, captionFlags, renderEditProblems, STYLE_EFFECTS, FLASH_MAX_PER_CLIP, FLASH_MAX_INTENSITY, ExternalShortsService, isMixedTrack, checkClipGates, loadPolicy, ownerMatch, checkScript, clipKey, effectiveDailyCap, REQUIRED_HUMAN_CHECKS, registerExternalShortsRoutes, canonicalJson, sha256Json, signEntry, verifyReviewLog, validateImport, GateError };
