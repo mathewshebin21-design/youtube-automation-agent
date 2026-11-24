@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 7,
   "channel": "CutsceneCity",
   "twitch_channel": "cutscenecity",
   "youtube_handle": "@cutscenecity",
@@ -62,7 +62,7 @@
     168
   ],
   "min_commentary_coverage": 0.6,
-  "daily_upload_cap": 2,
+  "daily_upload_cap": 1,
   "spoiler_keywords_file": "spoiler-keywords.txt",
   "upload_privacy": "private_only",
   "extra_human_checks": [],
@@ -134,7 +134,7 @@
       ]
     }
   },
-  "daily_upload_cap_note": "Hard maximum 2 in code (Python and Node): min(env or policy, 2); 0/negative/invalid blocks. Counted per IST (UTC+05:30) calendar day.",
+  "daily_upload_cap_note": "Hard maximum 1 in code (Python and Node), back from 2 in phase 2.7 (Compliance): min(env CUTSCENECITY_DAILY_CAP or policy, 1); 0/negative/invalid blocks. Counted per IST (UTC+05:30) calendar day.",
   "paid_promotion_values": [
     "none",
     "present"
@@ -145,5 +145,60 @@
       "tesseract OCR if installed"
     ],
     "effect": "flags only; overlays_third_parties_cleared always needs a signed human sign-off, with a 5+ word note when flagged or unavailable"
-  }
+  },
+  "caption_policy": {
+    "source": "mic_stem_only",
+    "source_note": "Captions are transcribed ONLY from a separate creator mic stem (OBS multitrack --mic-stream N or a --mic file). Mixed Twitch VOD tracks and game tracks are refused (they caption plot dialogue and other voices).",
+    "profanity_terms": [
+      "fuck",
+      "motherfuck",
+      "shit",
+      "bitch",
+      "cunt",
+      "asshole",
+      "bastard"
+    ],
+    "profanity_match": "case-insensitive prefix of each caption word (fuck -> fucking, fucked); masked as first letter + * (f******)",
+    "profanity_warn_first_seconds": 10,
+    "audio_bleep": false,
+    "audio_bleep_note": "LIMITATION: only the burned caption text is masked. The audio is NOT bleeped; a human must decide whether the spoken profanity is acceptable (captions_reviewed).",
+    "keyword_list_status": "PLACEHOLDER: Shebin/Compliance must replace the PLACEHOLDER_* entries with real story character names and plot keywords. Entries starting with PLACEHOLDER are ignored by the scan, and while any remain every caption review is flagged.",
+    "story_names": [
+      "Lucia",
+      "Jason",
+      "PLACEHOLDER_STORY_NAME_1",
+      "PLACEHOLDER_STORY_NAME_2",
+      "PLACEHOLDER_STORY_NAME_3"
+    ],
+    "plot_keywords": [
+      "PLACEHOLDER_PLOT_KEYWORD_1",
+      "PLACEHOLDER_PLOT_KEYWORD_2"
+    ],
+    "plot_keywords_note": "spoiler-defaults.json terms and spoiler-keywords.txt are scanned too (shared with the metadata spoiler gate)."
+  },
+  "edit_policy": {
+    "default_edit_style": "clean",
+    "styles": {
+      "off": [],
+      "clean": [
+        "captions"
+      ],
+      "hype": [
+        "captions",
+        "punch_in",
+        "shake",
+        "hook_zoom",
+        "end_fade",
+        "progress_bar",
+        "flash_cut"
+      ]
+    },
+    "choice": "Per clip, by a named human: review.py edit --clip F --style clean|hype --effects a,b --by NAME (signed edit_choice). Renders refuse edit effects without it.",
+    "flash_cut": "off by default; at most 1 per clip; intensity <= 0.5 (hard limits in edit.py and the Node gate)",
+    "default_note": "Default per-clip choice is clean (captions only, mic stem required). hype is opt-in: review.py edit --style hype --effects ... --by NAME. Nothing is edited until a human records the choice (fix 7)."
+  },
+  "game_audio_default": "stripped",
+  "game_audio_note": "Phase 2.7: commentary re-renders drop ALL game/music audio by default (audio_mode mic_stem). Keeping game audio is opt-in per render with review.py commentary --keep-game-audio (audio_mode mix, recorded as keep_game_audio_opt_in).",
+  "mixed_track_path_enabled": false,
+  "mixed_track_note": "Phase 2.7: a separate creator mic track is required. The mixed-track path (single Twitch VOD track + signed mixed_track_commentary_confirmed) is OFF by default; opt in with env CUTSCENECITY_ALLOW_MIXED_TRACK=true or this flag."
 }

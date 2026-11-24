@@ -32,7 +32,7 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
 - Example: `review.py commentary --mic-stream 1 --audio vo.wav --tts --voice-preset puck-hyped --caption-style yellow-pop --captions`
 
 ## Phase 2.2 (blocking fixes)
-- **Daily cap is hard-capped at 2** (raised from 1 in Phase 2.5). The effective cap is `min(CUTSCENECITY_DAILY_CAP or policy daily_upload_cap, 2)`, in both Python and Node; the policy default is 2. Values above 2 clamp to 2. A value of 0, a negative value or anything unparseable blocks all uploads (fail closed). Attempts are counted per **IST calendar day (UTC+05:30, midnight to midnight)** from the shared ledger.
+- **Daily cap is hard-capped at 2** (raised from 1 in Phase 2.5). The effective cap is `min(CUTSCENECITY_DAILY_CAP or policy daily_upload_cap, 2)`, in both Python and Node; the policy default is 2. Values above 2 clamp to 2. A value of 0, a negative value or anything unparseable blocks all uploads (fail closed). Attempts are counted per **IST calendar day (UTC+05:30, midnight to midnight)** from the shared ledger. **(Superseded in Phase 2.7: hard cap 1, see below.)**
 - **New required human check: `overlays_third_parties_cleared`.** It confirms that chat, alerts and usernames are blurred in the final render, that no viewer TTS or donation messages can be heard, and that no guest or voice-chat audio is in the mix.
   - `review.py precheck` now runs `overlay_scan.py` on the final render. It uses edge density (OpenCV) plus tesseract OCR when installed. OCR text is never stored, only counts and boxes.
   - The scan only flags. When it flags something, or can't run, the sign-off needs a note of 5+ words.
@@ -42,10 +42,10 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
   - If the declaration is missing, approve, export, the uploader and the Node route all block.
 - Package schema is now `cutscenecity.upload-package/4`. The agent import gains `paidProductPlacement`.
 - **Owner default:** `owner_twitch_login: "cutscenecity"` in `editorial-policy.json`, and `.env.example` sets `CUTSCENECITY_OWNER_TWITCH_LOGIN=cutscenecity`. The env value overrides the policy; if both are empty, every VOD is rejected (fail closed). Only cutscenecity VODs pass, which also lets the CI candidate step run.
-- **Game audio is kept by default.** Background music, game voices and story/cutscene scenes stay in the clip unchanged; nothing strips, mutes or ducks them, and no step drops cutscene segments (`no_story_cutscene` is a human sign-off only).
+- **Game audio is kept by default.** Background music, game voices and story/cutscene scenes stay in the clip unchanged; nothing strips, mutes or ducks them, and no step drops cutscene segments (`no_story_cutscene` is a human sign-off only). **(Superseded in Phase 2.7: game audio is stripped by default; keeping it is opt-in with `--keep-game-audio`.)**
   - `review.py commentary` mixes game + mic (1.0) + voiceover in `mix` mode.
   - `--music-volume` or `CUTSCENECITY_MUSIC_VOLUME` (default 1.0 = unchanged; must be above 0 and at most 1) lowers the game bed after review.
-  - `--strip-game-audio` (the old `mic_stem`) is opt-in.
+  - `--strip-game-audio` (the old `mic_stem`) is opt-in. (Phase 2.7: stripping is now the default; the flag is kept as a no-op.)
   - loudnorm is overall loudness only.
   - With OBS multitrack, put game/desktop audio on track 1 without the mic, so the mic isn't doubled.
   - Licensed in-game radio music may trigger Content ID claims, so review it before any upload. `music_risk_cleared` still needs the fingerprint pre-check and a note.
@@ -55,7 +55,7 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
   - CutsceneCity routing: track 1 = live mix; track 2 (Twitch VOD Track) = mic + game + story audio, all kept.
 - **A downloaded Twitch VOD still has ONE mixed audio track.** The VOD Track only chooses *what* goes into the VOD; the mic isn't stored separately. VOD 2937578726 probes as 1 video + 1 stereo audio stream (checked with ffprobe here). Commentary therefore can't be measured from the VOD.
 - **For the best gate results, also keep a local OBS recording with the mic on its own track.** Set Settings → Output → Recording → Audio Track to tick e.g. 1 + 3, and put only the mic on track 3. Then run `review.py commentary --clip <clip> --mic-stream N` with the 0-based audio index; the measured mic path is preferred automatically.
-- **Mixed-track path (no mic stem; creator-owned VODs only).** `original_commentary` and `live_reaction_preserved` show **WARN**, not FAIL. They pass only after a signed `review.py signoff --check mixed_track_commentary_confirmed --by NAME --note "<5+ words: live commentary audible>"`.
+- **Mixed-track path (no mic stem; creator-owned VODs only).** `original_commentary` and `live_reaction_preserved` show **WARN**, not FAIL. They pass only after a signed `review.py signoff --check mixed_track_commentary_confirmed --by NAME --note "<5+ words: live commentary audible>"`. **(Phase 2.7: OFF by default; opt in with `CUTSCENECITY_ALLOW_MIXED_TRACK=true` or policy `mixed_track_path_enabled`.)**
   - The manifest records `commentary_source: mic_stem | mixed_track_signed`.
   - The voice-band "speech share" (`mixed_track_speech_share`) is a hint only. Game voices, cutscene dialogue and music count too; on VOD 2937578726 it reads 100% for every clip.
   - Non-owner VODs are still rejected.
@@ -76,14 +76,14 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
 - The Node route (`POST /api/gta6/external-shorts`) and `upload_private.py` accept 1080x1920, 1440x2560 and 2160x3840. The Node route rejects any other `render.upscale` value or output resolution.
 - Re-render with the commentary stem: `review.py commentary ... --upscale 2160` (default) or `--upscale off`.
 
-## Daily cap 2 (Phase 2.5)
+## Daily cap 2 (Phase 2.5; superseded by Phase 2.7: cap 1)
 
-- Shebin approved raising the cap from 1 to 2 uploads per day. The hard clamp is `min(cap, 2)` in `gatelog.py` and `external-shorts.js`, and `daily_upload_cap` defaults to 2 in `editorial-policy.json` and `.env.example`.
+- Shebin approved raising the cap from 1 to 2 uploads per day. The hard clamp is `min(cap, 2)` in `gatelog.py` and `external-shorts.js`, and `daily_upload_cap` defaults to 2 in `editorial-policy.json` and `.env.example`. **(Phase 2.7: reverted to a hard cap of 1, see below.)**
 - Unchanged: 0, negative or unreadable values block all uploads; values above 2 clamp to 2; the day boundary is the IST calendar day (UTC+05:30); every upload is still private-only and needs its own human approval; `upload_private.py` and the Node route both re-check the cap and duplicates against the shared ledger.
 
-## Edit stage: captions, animations and effects (Phase 2.6, ON by default: `hype`)
+## Edit stage: captions, animations and effects (Phase 2.6; defaults and gates changed in Phase 2.7, see below)
 
-- `--edit-style off|clean|hype` on `pipeline.py --render` and `review.py commentary`, or env `CUTSCENECITY_EDIT_STYLE`. **Default `hype`.** `clean` = word-by-word captions only. `off` = no edit pass (the old `--captions` SRT path still works); the test suite sets `CUTSCENECITY_EDIT_STYLE=off` to stay fast.
+- `--edit-style off|clean|hype` on `pipeline.py --render` and `review.py commentary`, or env `CUTSCENECITY_EDIT_STYLE`. **2.6 default was `hype`; 2.7 changes it (below).** `clean` = word-by-word captions only. `off` = no edit pass (the old `--captions` SRT path still works); the test suite sets `CUTSCENECITY_EDIT_STYLE=off` to stay fast.
 - Order: ffmpeg render (layout, blur regions, audio mix + loudnorm) → **edit (captions/effects)** → upscale (default 2160x3840) → `qa.py` → overlay scan / `review.py precheck` → export SHA-256. The package SHA binds the final edited + upscaled file.
 - ffmpeg + libass only (`tools/twitch-shorts/edit.py`). No paid services, stock assets, added music or SFX. The edit pass copies the audio stream (`-c:a copy`), so the original audio and `--music-volume` are untouched.
 - **Word-by-word captions:** faster-whisper word timestamps (`CUTSCENECITY_WHISPER_MODEL`, default `small`; a local model path works). ASS events reveal the words of a 1-3 word group one by one; the current word pops in (130% → 100% over 120 ms) and is highlighted. Bold white Liberation Sans, black outline, MarginV 360 px (above the bottom 15% of 1920). Captions are the exact transcribed words; only ASS control characters `\ { }` are dropped. Swear words are kept as said. Files: `short_NN.words.ass`, `short_NN.words.json`. Transcription is two-pass: Silero VAD (threshold 0.25) first; only if that finds no words, a no-VAD pass whose low-confidence (avg_logprob < -1.0, no_speech_prob > 0.6, compression > 2.4) and repeated segments are dropped, never rewritten (`render.transcribe_mode`). On mixed-track VODs with loud game audio, whisper often hears only a few lines, so captions can be sparse and may contain mishearings: they stay `..._NEEDS_HUMAN_CHECK`. If faster-whisper is missing or no speech is found, captions are skipped and recorded.
@@ -96,3 +96,36 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
 - `render` records `edit_style`, `zoom_count`, `punch_ins`, `shake_at`, `word_captions`, `word_count`, `edit_seconds`.
 - `--window START-END` (repeatable) renders exact windows (seconds in the input file) instead of auto-selection.
 - The transformation note stays Shebin's own text; nothing here writes it.
+
+## Phase 2.7: Compliance fixes to the edit stage (local branch `cutscenecity-phase2.7-compliance`)
+The 2.6 hype default stays recoverable on commit 02c223c. Shared rules live in `edit_gates.py`; the Node gate re-checks them on its own.
+1. **No automatic edit.** `pipeline.py --render` renders the PRE-EDIT clip only. `--edit-style clean|hype`, `--captions`, `--caption-style` and `--flash-cut` on `pipeline.py` are refused, with a pointer to `review.py edit`. An edit style without a recorded human choice raises an error, including when it comes from env `CUTSCENECITY_EDIT_STYLE`.
+2. **Captions only from a mic stem.** Captions come from an OBS multitrack mic stream (`--mic-stream N`) or a mic file (`--mic`) and nothing else. If the clip only has the mixed Twitch/game track, the captions effect is refused with a clear error (`CaptionSourceError`), and the Node gate rejects any `caption_source` that is not `mic_*`. The old SRT `--captions` path is removed.
+3. **`captions_reviewed` human gate** (Python `compliance.py` and Node `external-shorts.js`). It applies when captions are burned in.
+   - `review.py signoff --check captions_reviewed` checks that `short_NN.words.json` still matches the SHA-256 recorded at render time, and puts `words_json_sha256` in the signed log entry.
+   - approve, export, `upload_private` and Node ingest all require that signed entry, for this exact final file and this exact words.json. The package carries `captions.words.json` plus a `captions` block.
+4. **Profanity.** Words matching `editorial-policy.json` `caption_policy.profanity_terms` (as a case-insensitive prefix) are masked as first letter + `*` (`f******`) in words.json and the ASS file, and marked `masked: true`.
+   - Profanity in the first 10 s is flagged, and a flagged caption review needs a note of 5+ words.
+   - Unmasked profanity blocks the clip.
+   - **LIMITATION: the audio is NOT bleeped**; a human decides about the spoken words.
+5. **Spoiler/keyword scan on the caption text.** It matches `caption_policy.story_names` and `plot_keywords`, plus the shared `spoiler-defaults.json` and `spoiler-keywords.txt` lists, as whole tokens, including multi-word terms.
+   - Hits are flagged and need a note of 5+ words.
+   - The lists are seeded with Lucia and Jason (publicly announced protagonists) plus `PLACEHOLDER_*` entries. **Shebin/Compliance must fill these in**; until then every caption review is flagged as `keyword_list_incomplete`.
+6. **Overlay precheck scans the pre-edit render.** Every edit keeps `short_NN.preedit.mp4` (1080x1920, before captions/effects) with its SHA-256. `review.py precheck` scans that file, so our own captions can't trigger flags, and binds the result to the FINAL file hash. If the pre-edit file is missing or stale, it scans the final file with the caption band (0.66–0.84 of the height) and the progress bar masked.
+7. **Edit style + effects are a per-clip human choice.**
+   - Command: `review.py edit --clip short_01.mp4 --style clean|hype --effects captions,punch_in,shake,hook_zoom,end_fade,progress_bar,flash_cut --by NAME [--caption-style word-pop-cyan] [--flash-intensity 0.5] [--no-render]`.
+   - It signs an `edit_choice` log entry (style, effects, flash %, caption style, reviewer) and re-renders with the clip's previous audio setup. `review.py commentary` re-renders reuse it.
+   - `clean` allows only `captions`.
+   - The `style_rotation` gate (Python and Node) fails when the render's style or effects differ from the recorded choice or no choice exists. approve, export, upload and ingest also require the signed entry.
+8. **Flash cut** is off unless `flash_cut` is chosen: at most 1 per clip, intensity ≤ 0.5 (default 0.5), hard limits in `edit_gates.py`/`edit.py` and the Node gate.
+
+The render records `edit_style`, `edit_effects`, `edit_choice_by`, `caption_source`, `words_json`, `words_json_sha256`, `caption_review` (flags + warnings), `pre_edit_file`, `pre_edit_sha256`, `flash_cuts` and `flash_intensity`.
+
+## Phase 2.7 defaults (Compliance; separate commit on the same branch)
+- **Game audio is stripped by default.** `review.py commentary` renders `audio_mode=mic_stem` (mic + optional voiceover only). Keeping game/music audio is opt-in per render with `--keep-game-audio` (`audio_mode=mix`, recorded as `render.keep_game_audio_opt_in: true`). `render.render(audio_mode="mix")` without the opt-in raises an error. Python `live_reaction_preserved` and the Node gate fail a `mix` render that has no opt-in. `--strip-game-audio` is accepted as a no-op.
+- **A separate mic track is required.** The mixed-track path (one Twitch VOD track plus a signed `mixed_track_commentary_confirmed`) is **off by default**. `original_commentary`, `live_reaction_preserved` and the `mixed_track_commentary_confirmed` hint FAIL with "separate mic track required", and the Node gate does the same. Opt in with env `CUTSCENECITY_ALLOW_MIXED_TRACK=true` or policy `mixed_track_path_enabled: true`.
+- **Hard daily cap 1** (back from 2), in `gatelog.py`, `external-shorts.js`, the `editorial-policy.json` `daily_upload_cap` and `.env.example`. The existing `CUTSCENECITY_DAILY_CAP` override is kept; it can lower the cap or set it to 0, but values above 1 clamp to 1. Days are still counted in IST.
+- **Default edit style `clean`; `hype` is opt-in.**
+  - `review.py edit --by NAME` with no `--style`/`--effects` records the default choice `clean` + `captions`, which needs a mic stem.
+  - `hype` needs `--style hype --effects ...`.
+  - Nothing is edited until a human records the choice (fix 7): renders without a recorded choice stay pre-edit, and an explicit or env `CUTSCENECITY_EDIT_STYLE` style without a choice is refused.

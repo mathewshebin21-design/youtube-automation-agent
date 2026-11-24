@@ -99,6 +99,11 @@ def verify_package(pkg_dir):
         for n in compliance.required_human_checks(clip):
             if n not in signed:
                 problems.append(f"{n}: no signed sign-off")
+        import edit_gates   # phase 2.7: signed per-clip edit choice + captions_reviewed bound to words.json
+        problems += edit_gates.signed_problems(clip, entries, pkg["file_sha256"], pkg_dir / edit_gates.WORDS_PACKAGE_NAME)
+        cap = pkg.get("captions")
+        if edit_gates.captions_burned(clip.get("render")) and (not cap or cap.get("words_json_sha256") != (clip.get("render") or {}).get("words_json_sha256")):
+            problems.append("package captions block does not match the reviewed words.json")
     except PermissionError as e:
         problems.append(str(e))
     pol = json.loads((HERE / "editorial-policy.json").read_text())
