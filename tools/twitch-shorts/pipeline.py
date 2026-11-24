@@ -80,7 +80,7 @@ def manual_windows(specs, duration):
 
 
 def join_adjacent(rows, max_len=60.0):
-    """Merge picks that touch end-to-start into one clip (<= max_len s); records the join offset for --flash-cut."""
+    """Merge picks that touch end-to-start into one clip (<= max_len s); records the join offset (flash_cut effect)."""
     out = []
     for r in sorted(rows, key=lambda r: r["start"]):
         prev = out[-1] if out else None
@@ -91,6 +91,18 @@ def join_adjacent(rows, max_len=60.0):
         else:
             out.append(dict(r))
     return out
+
+
+def pre_edit_refusal(args):
+    """Phase 2.7: pipeline.py renders the PRE-EDIT clip only. Captions need a mic stem (a Twitch VOD has one mixed
+    track) and the edit style/effects are a per-clip human choice recorded later with review.py edit."""
+    if args.captions:
+        return ("--captions refused: captions come only from a separate creator mic stem, never the mixed VOD track. "
+                "Use review.py commentary --mic/--mic-stream, then review.py edit --effects captions")
+    if (args.edit_style or "off") not in ("off", "none") or args.caption_style or args.flash_cut:
+        return ("edit style/effects are chosen per clip by a human after review: review.py edit --clip short_NN.mp4 "
+                "--style clean|hype --effects ... --by NAME (pipeline.py renders the pre-edit clip only)")
+    return None
 
 
 def credit_line(owner, vod_url):
@@ -116,18 +128,21 @@ def main():
     parser.add_argument("--layout", choices=render.LAYOUTS, default="blur")
     parser.add_argument("--crop-x", default="0.5", help="0..1 or 'smart'")
     parser.add_argument("--facecam-box", help="x,y,w,h fractions of the source frame, for --layout split")
-    parser.add_argument("--captions", action="store_true", help="burn in faster-whisper captions if installed")
+    parser.add_argument("--captions", action="store_true", help=argparse.SUPPRESS)  # refused since phase 2.7 (mixed track)
     parser.add_argument("--info-json", help="yt-dlp .info.json for --input files (owner check needs it)")
     parser.add_argument("--upscale", default=None, help="2160 (default) | 1440 | off; env CUTSCENECITY_UPSCALE")
     parser.add_argument("--profile", default=None, help="stream-layout profile name from editorial-policy.json")
-    parser.add_argument("--edit-style", default=None, choices=("off", "clean", "hype"),
-                        help="automatic edit stage: hype (default) | clean (captions only) | off; env CUTSCENECITY_EDIT_STYLE")
-    parser.add_argument("--caption-style", default=None, help="word caption highlight style from editorial-policy.json word_caption_styles")
+    parser.add_argument("--edit-style", default=None, choices=("off", "none", "clean", "hype"),
+                        help="only off/none here (default): edits are a per-clip human choice made after review (review.py edit)")
+    parser.add_argument("--caption-style", default=None, help=argparse.SUPPRESS)  # moved to review.py edit
     parser.add_argument("--window", action="append", default=[], metavar="START-END",
                         help="render this exact window (seconds in the input file) instead of auto-selection; repeatable")
     parser.add_argument("--join-adjacent", action="store_true", help="join two adjacent picks into one clip (<= 60 s total)")
-    parser.add_argument("--flash-cut", action="store_true", help="white flash where a clip joins two adjacent picks (off by default)")
+    parser.add_argument("--flash-cut", action="store_true", help=argparse.SUPPRESS)  # moved to review.py edit --effects flash_cut
     args = parser.parse_args()
+    refuse = pre_edit_refusal(args)
+    if refuse:
+        parser.error(refuse)
     if not 15 <= args.seconds <= 60:
         raise ValueError("--seconds must be 15-60")
     facecam = render.parse_box(args.facecam_box) if args.facecam_box else None
@@ -188,14 +203,14 @@ def main():
                              "containsSyntheticMedia": None},
                 "commentary": {"mic_source": None, "tts_used": False, "commentary_source": None},
                 "paid_promotion_suggestion": "none",
+                "joins": row.get("joins", []),
                 "transformation_note": ""}
         compliance.init_clip(clip)
         if args.render:
-            clip["render"] = render.render(video, row["start"], row["end"], out, name, captions=args.captions,
+            clip["render"] = render.render(video, row["start"], row["end"], out, name,
                                            layout=args.layout, crop_x=crop_x, facecam=facecam,
                                            blur_regions=profile.get("blur_regions", []), upscale=args.upscale,
-                                           edit_style=args.edit_style, word_caption_style=args.caption_style,
-                                           joins=row.get("joins", []), flash_cut=args.flash_cut)
+                                           edit_style="off")   # pre-edit; edits: review.py edit (per-clip human choice)
             clip["render"]["facecam"] = facecam
             clip["render"]["profile"] = args.profile
             clip["technical_qa"] = qa.validate(out / name, row["start"], row["end"])

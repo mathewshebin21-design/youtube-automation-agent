@@ -1,16 +1,17 @@
 """Automatic edit stage (captions/effects) for CutsceneCity Shorts. ffmpeg + libass only: no paid services,
 no stock assets, no added music or SFX. Runs on the rendered 1080x1920 file, BEFORE upscale and qa.py.
 
-Styles (--edit-style / env CUTSCENECITY_EDIT_STYLE, default "hype"):
-  off   - no edit pass (old --captions SRT path still works)
-  clean - word-by-word animated captions only
-  hype  - captions + punch-in zooms on audio-energy spikes (max 1 per 4 s, ~1.15x, 0.3 s ease in/out),
-          0.2 s shake on the top 1-2 spikes, 0.5 s 1.1->1.0 hook zoom-out, 0.3 s fade at the end,
-          thin progress bar along the bottom edge. Optional white flash at joins of two adjacent picks
-          (--flash-cut, off by default).
-Audio is never touched: the edit pass copies the audio stream (-c:a copy), so music volume and loudness
-from the render are kept exactly.
-Captions are the exact faster-whisper words (only ASS control characters \\ { } are removed).
+Styles (phase 2.7: default choice "clean", hype opt-in; applied only through a per-clip human edit choice, review.py edit):
+  off   - no edit pass
+  clean - word-by-word animated captions only (effects: captions)
+  hype  - any of: captions, punch_in (zooms on audio-energy spikes, max 1 per 4 s, ~1.15x, 0.3 s ease in/out),
+          shake (0.2 s on the top 1-2 spikes), hook_zoom (0.5 s 1.1->1.0), end_fade (0.3 s), progress_bar,
+          flash_cut (white flash at the join of two adjacent picks: off by default, max 1 per clip, intensity <= 0.5).
+The human picks the style AND the effects list per clip; apply() refuses to edit without that recorded choice.
+Captions are transcribed ONLY from a separate creator mic stem (never the mixed Twitch/game track), strong
+profanity is masked (f******) and caption text is scanned for story names / plot keywords (edit_gates.py).
+Audio is never touched: the edit pass copies the audio stream (-c:a copy). LIMITATION: masked words are NOT
+bleeped in the audio.
 """
 import json
 import os
@@ -18,9 +19,11 @@ import pathlib
 import subprocess
 import time
 
+import edit_gates
+
 EDIT_ENV = "CUTSCENECITY_EDIT_STYLE"
-EDIT_STYLES = ("off", "clean", "hype")
-DEFAULT_EDIT_STYLE = "hype"
+EDIT_STYLES = edit_gates.EDIT_STYLES
+DEFAULT_EDIT_STYLE = "clean"       # phase 2.7: default per-clip choice; hype opt-in; never applied without a human choice
 WHISPER_ENV = "CUTSCENECITY_WHISPER_MODEL"
 FPS = 30
 W, H = 1080, 1920
@@ -37,27 +40,34 @@ SHAKE_PX = 10
 HOOK_SECONDS, HOOK_ZOOM = 0.5, 1.1
 FADE_SECONDS = 0.3
 BAR_PX = 10
+FLASH_SECONDS = (0.04, 0.12)    # before / after the join
+CAPTION_BAND = (0.66, 0.84)     # fraction of the frame height covered by word captions (overlay-scan mask fallback)
+PROGRESS_BAND = (0.99, 1.0)
 
 
 def edit_style(value=None):
     raw = str(value if value not in (None, "") else os.getenv(EDIT_ENV, DEFAULT_EDIT_STYLE)).strip().lower()
+    raw = "off" if raw == "none" else raw
     if raw not in EDIT_STYLES:
         raise ValueError("edit style must be off, clean or hype")
     return raw
 
 
 # ---------- captions ----------
-def transcribe_words(media, model=None):
-    """[{word,start,end}] from faster-whisper word timestamps (seconds from the start of `media`).
-    [] if faster-whisper is not installed or nothing was said. Never invents text."""
+def transcribe_words(media, model=None, start=None, duration=None, stream="0:a:0"):
+    """[{word,start,end}] from faster-whisper word timestamps (seconds from `start` in `media`).
+    Callers pass the creator MIC STEM only (edit_gates.caption_source): a mic file, or an OBS multitrack stream.
+    None if faster-whisper is not installed, [] if nothing was said. Never invents text."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         return None
     import numpy as np
     # Decode with ffmpeg and pass samples (avoids PyAV version issues inside faster-whisper).
-    p = subprocess.run(["ffmpeg", "-v", "error", "-i", str(media), "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
-                       capture_output=True, check=True)
+    seek = ["-ss", str(start)] if start is not None else []
+    dur = ["-t", str(duration)] if duration is not None else []
+    p = subprocess.run(["ffmpeg", "-v", "error", *seek, "-i", str(media), *dur, "-map", stream, "-ac", "1", "-ar", "16000",
+                        "-f", "f32le", "-"], capture_output=True, check=True)
     audio = np.frombuffer(p.stdout, dtype="<f4").copy()
     if audio.size == 0:
         return []
@@ -213,25 +223,37 @@ def shake_expr(punches, axis):
     return "+".join(parts) if parts else "0"
 
 
-def video_graph(style, duration, punches=(), ass_name=None, joins=(), flash=False):
-    """[0:v] -> [v]. Captions are drawn after the zoom so they stay steady."""
+def video_graph(style, duration, punches=(), ass_name=None, joins=(), flash=False, effects=None,
+                flash_intensity=edit_gates.FLASH_DEFAULT_INTENSITY):
+    """[0:v] -> [v]. Captions are drawn after the zoom so they stay steady. `effects` (default: every non-flash
+    effect of the style) selects the pieces; the flash needs flash=True AND is capped by edit_gates.flash_plan."""
     if ass_name is not None and not all(c.isalnum() or c in "._-" for c in ass_name):
         raise ValueError("unsafe subtitle file name")
+    allowed = edit_gates.STYLE_EFFECTS[style]
+    eff = set(allowed if effects is None else effects) - {"flash_cut"}
+    bad = eff - set(allowed)
+    if bad:
+        raise ValueError(f"effects {sorted(bad)} not allowed for style {style}")
+    flashes = edit_gates.flash_plan(joins, flash and style == "hype", flash_intensity)
     chain = [f"fps={FPS}"]
-    if style == "hype":
-        z = zoom_expr(punches)
-        sx, sy = shake_expr(punches, "x"), shake_expr(punches, "y")
+    zp = [p for p in punches if "punch_in" in eff]
+    if not ("shake" in eff):
+        zp = [dict(p, shake=False) for p in zp]
+    if zp or "hook_zoom" in eff:
+        z = zoom_expr(zp, hook="hook_zoom" in eff)
+        sx, sy = shake_expr(zp, "x"), shake_expr(zp, "y")
         chain.append(f"zoompan=z='{z}':x='clip(iw/2-iw/zoom/2+{sx},0,iw-iw/zoom)':y='clip(ih/2-ih/zoom/2+{sy},0,ih-ih/zoom)'"
                      f":d=1:s={W}x{H}:fps={FPS}")
         chain.append("setpts=PTS-STARTPTS")
-        if flash:
-            for j in joins:
-                chain.append(f"drawbox=x=0:y=0:w=iw:h=ih:color=white@0.85:t=fill:enable='between(t,{j - 0.04:.3f},{j + 0.12:.3f})'")
+    for j in flashes:
+        chain.append(f"drawbox=x=0:y=0:w=iw:h=ih:color=white@{float(flash_intensity):.2f}:t=fill"
+                     f":enable='between(t,{j - FLASH_SECONDS[0]:.3f},{j + FLASH_SECONDS[1]:.3f})'")
     chain.append("setsar=1")
     if ass_name:
         chain.append(f"ass={ass_name}")
-    if style == "hype":
+    if "progress_bar" in eff:
         chain.append(f"drawbox=x=0:y=ih-{BAR_PX}:w='iw*min(t/{duration:.3f},1)':h={BAR_PX}:color=white@0.9:t=fill")
+    if "end_fade" in eff:
         chain.append(f"fade=t=out:st={max(duration - FADE_SECONDS, 0):.3f}:d={FADE_SECONDS}")
     return "[0:v]" + ",".join(chain) + "[v]"
 
@@ -242,26 +264,54 @@ def duration_of(media):
     return float(json.loads(p.stdout)["format"]["duration"])
 
 
-def apply(path, style, joins=(), flash=False, word_style=None, model=None, energy_source=None):
-    """Edit `path` in place (tmp + os.replace). Audio stream copied unchanged. Returns a render-record dict."""
+def apply(path, choice, joins=(), model=None, energy_source=None, caption_source=None, pol=None):
+    """Edit `path` in place (tmp + os.replace) exactly as the recorded per-clip human `choice` says
+    ({edit_style, effects, by, flash_intensity_pct, caption_style}). Refuses without a choice. Captions only from
+    `caption_source` (a mic stem, edit_gates.caption_source); none -> CaptionSourceError. Audio stream copied unchanged."""
     path = pathlib.Path(path)
+    if choice is None:
+        raise ValueError("no per-clip human edit choice recorded: run review.py edit --clip ... --style ... --effects ... --by NAME")
+    choice = edit_gates.validate_choice(choice)
+    style, effects = choice["edit_style"], choice["effects"]
     if style == "off":
-        return {"edit_style": "off"}
+        return {"edit_style": "off", "edit_effects": [], "edit_choice_by": choice["by"]}
+    if "captions" in effects and not caption_source:
+        raise edit_gates.CaptionSourceError(edit_gates.MIC_REQUIRED)
+    pol = pol or edit_gates.policy()
     t0 = time.monotonic()
     duration = duration_of(path)
-    word_style = word_style if word_style in WORD_STYLES else DEFAULT_WORD_STYLE
-    words = transcribe_words(path, model)
+    word_style = choice["caption_style"] if choice["caption_style"] in WORD_STYLES else DEFAULT_WORD_STYLE
+    words = None
+    rec = {"edit_style": style, "edit_effects": effects, "edit_choice_by": choice["by"], "edit_audio": "copied unchanged (-c:a copy)"}
     ass_name = None
-    if words:
-        ass_name = path.stem + ".words.ass"
-        (path.parent / ass_name).write_text(build_ass(words, duration, WORD_STYLES[word_style]))
-        (path.parent / (path.stem + ".words.json")).write_text(json.dumps(words, indent=1))
-    if style == "hype":
+    if "captions" in effects:
+        src = caption_source
+        words = transcribe_words(src["media"], model, start=src.get("start"), duration=duration,
+                                 stream=src["stream"])
+        rec["caption_source"] = src["label"]
+        if words:
+            words = edit_gates.mask_words(words, pol)
+            ass_name = path.stem + ".words.ass"
+            words_name = path.stem + ".words.json"
+            (path.parent / ass_name).write_text(build_ass(words, duration, WORD_STYLES[word_style]))
+            (path.parent / words_name).write_text(json.dumps(words, indent=1))
+            flags = edit_gates.caption_flags(words, pol)
+            rec.update({"words_json": words_name, "words_json_sha256": edit_gates.sha256_bytes(path.parent / words_name),
+                        "caption_review": {**flags, "warnings": edit_gates.flag_reasons(flags)},
+                        "audio_bleep": "NOT applied: captions are masked, the spoken audio is unchanged (human review)"})
+        rec.update({"word_captions": ("BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK" if words else
+                                      ("SKIPPED_NO_FASTER_WHISPER" if words is None else "SKIPPED_NO_SPEECH")),
+                    "word_caption_style": word_style if words else None, "word_count": len(words or []),
+                    "transcribe_mode": (lambda m: m if isinstance(m, str) and words is not None else None)(getattr(transcribe_words, "mode", None))})
+    else:
+        rec["word_captions"] = "NOT_CHOSEN"
+    punches = []
+    if "punch_in" in effects:
         src, s0 = (energy_source[0], energy_source[1]) if energy_source else (path, None)
         punches = spikes(energy_db(src, start=s0, duration=duration if energy_source else None), duration=duration)
-    else:
-        punches = []
-    graph = video_graph(style, duration, punches, ass_name, joins, flash)
+    intensity = choice["flash_intensity_pct"] / 100 if "flash_cut" in effects else edit_gates.FLASH_DEFAULT_INTENSITY
+    flashes = edit_gates.flash_plan(joins, "flash_cut" in effects, intensity)
+    graph = video_graph(style, duration, punches, ass_name, flashes, bool(flashes), effects=effects, flash_intensity=intensity)
     tmp = path.with_name(path.stem + ".edit.tmp.mp4")
     try:
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path.name, "-filter_complex", graph,
@@ -270,16 +320,14 @@ def apply(path, style, joins=(), flash=False, word_style=None, model=None, energ
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
-    rec = {"edit_style": style, "edit_seconds": round(time.monotonic() - t0, 1),
-           "word_captions": ("BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK" if words else
-                             ("SKIPPED_NO_FASTER_WHISPER" if words is None else "SKIPPED_NO_SPEECH")),
-           "word_caption_style": word_style if words else None, "word_count": len(words or []),
-           "transcribe_mode": (lambda m: m if isinstance(m, str) and words is not None else None)(getattr(transcribe_words, "mode", None)),
-           "edit_audio": "copied unchanged (-c:a copy)"}
+    rec["edit_seconds"] = round(time.monotonic() - t0, 1)
     if style == "hype":
+        shake = "shake" in effects
         rec.update({"spike_source": "original source audio (pre-loudnorm)" if energy_source else "rendered audio",
                     "punch_ins": [p["t"] for p in punches], "zoom_count": len(punches),
-                    "shake_at": [p["t"] for p in punches if p["shake"]], "hook_zoom": f"{HOOK_ZOOM}->1.0 over {HOOK_SECONDS}s",
-                    "end_fade": f"{FADE_SECONDS}s", "progress_bar": True,
-                    "flash_cuts": [round(j, 3) for j in joins] if flash else []})
+                    "shake_at": [p["t"] for p in punches if p["shake"] and shake],
+                    "hook_zoom": f"{HOOK_ZOOM}->1.0 over {HOOK_SECONDS}s" if "hook_zoom" in effects else None,
+                    "end_fade": f"{FADE_SECONDS}s" if "end_fade" in effects else None,
+                    "progress_bar": "progress_bar" in effects,
+                    "flash_cuts": [round(j, 3) for j in flashes], "flash_intensity": intensity if flashes else None})
     return rec

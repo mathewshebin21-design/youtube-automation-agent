@@ -106,11 +106,11 @@ MUSIC_VOLUME_ENV = "CUTSCENECITY_MUSIC_VOLUME"
 
 def music_volume(value=None):
     """Game/music bed level. Default 1.0 = original audio unchanged; 0 < v < 1 lowers it under commentary.
-    Removing game audio entirely is the separate opt-in --strip-game-audio (mic_stem)."""
+    Phase 2.7: commentary re-renders strip game audio by default (mic_stem); this level applies only with --keep-game-audio."""
     raw = os.getenv(MUSIC_VOLUME_ENV, "1.0") if value is None else value
     v = float(raw)
     if not 0.0 < v <= 1.0:
-        raise ValueError("music volume must be > 0 and <= 1.0 (use --strip-game-audio to remove game audio)")
+        raise ValueError("music volume must be > 0 and <= 1.0 (game audio is stripped by default; --keep-game-audio keeps it)")
     return v
 
 
@@ -139,28 +139,6 @@ def audio_filter(mode, mic_label=None, voice_label=None, game_volume=1.0, game_l
     if voice_label:
         return f"[{mic_label}]volume=1.0[m];[{voice_label}]volume=1.0[c];[m][c]amix=inputs=2:duration=first:normalize=0,{LOUDNORM}[a]"
     return f"[{mic_label}]volume=1.0,{LOUDNORM}[a]"
-
-
-def transcribe(video, start, end, srt_path, model="small"):
-    """Burn-in captions source: faster-whisper if installed, else skip (returns False). Never invents text."""
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        return False
-    wav = pathlib.Path(srt_path).with_suffix(".wav")
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(start), "-i", str(video), "-t", str(end - start),
-                    "-vn", "-ac", "1", "-ar", "16000", str(wav)], check=True)
-    segs, _ = WhisperModel(model, compute_type="int8").transcribe(str(wav), vad_filter=True)
-    lines = []
-    for i, s in enumerate(segs, 1):
-        text = s.text.strip()
-        if text:
-            lines.append(f"{i}\n{_ts(s.start)} --> {_ts(s.end)}\n{text}\n")
-    wav.unlink(missing_ok=True)
-    if not lines:
-        return False
-    pathlib.Path(srt_path).write_text("\n".join(lines))
-    return True
 
 
 def _ts(sec):
@@ -269,6 +247,12 @@ def upscale(path, setting):
 
 
 def render(video, start, end, out_dir, out_name, captions=False, **opts):
+    """Render one clip. Phase 2.7: the edit stage (captions/effects) runs only with a recorded per-clip human
+    `edit_choice` ({edit_style, effects, by, ...}); edit_style other than off without one is refused. Captions come
+    only from a separate mic stem. When an edit runs, the pre-edit render is kept as <stem>.preedit.mp4 so the
+    overlay precheck scans frames without our own captions."""
+    import edit_gates
+    import shutil
     out_dir = pathlib.Path(out_dir)
     video = pathlib.Path(video).resolve()
     for key in ("commentary", "mic"):
@@ -278,33 +262,59 @@ def render(video, start, end, out_dir, out_name, captions=False, **opts):
         opts["crop_x"] = smart_crop_x(video, start, end)
     elif opts.get("crop_x") in (None, "smart"):
         opts["crop_x"] = 0.5
-    style = edit_stage.edit_style(opts.pop("edit_style", None))   # default hype; off = opt-out
-    joins, flash = list(opts.pop("joins", None) or []), bool(opts.pop("flash_cut", False))
-    word_style = opts.pop("word_caption_style", None)
-    srt_name = None
-    caption_status = "OFF"
-    if captions and style == "off":   # clean/hype burn word-by-word captions in the edit stage instead
-        srt_name = pathlib.Path(out_name).stem + ".srt"
-        if transcribe(video, start, end, out_dir / srt_name):
-            caption_status = "BURNED_IN_NEEDS_HUMAN_CHECK"
-        else:
-            srt_name, caption_status = None, "SKIPPED_NO_FASTER_WHISPER_OR_NO_SPEECH"
+    if captions:
+        raise edit_gates.CaptionSourceError("the old SRT --captions path was removed in phase 2.7: captions are a per-clip "
+                                            "edit effect (review.py edit --effects captions) and need a separate mic stem")
+    choice = opts.pop("edit_choice", None)
+    asked = opts.pop("edit_style", None)
+    if choice is not None:                                        # the recorded human choice wins over env defaults
+        choice = edit_gates.validate_choice(choice)
+        if asked not in (None, "") and edit_stage.edit_style(asked) != choice["edit_style"]:
+            raise ValueError(f"edit style {asked} differs from the recorded human edit choice {choice['edit_style']}")
+        style = choice["edit_style"]
+    else:
+        # No recorded human choice -> no edit (pre-edit render). An explicit style or env style is refused (fix 7);
+        # the default choice (clean) is only applied once a human records it with review.py edit.
+        asked = asked if asked not in (None, "") else (os.getenv(edit_stage.EDIT_ENV) or "off")
+        style = edit_stage.edit_style(asked)
+        if style != "off":
+            raise ValueError(f"edit style {style} needs a recorded per-clip human edit choice (review.py edit --clip ... "
+                             "--style ... --effects ... --by NAME); refusing to apply edits without one")
+    joins = list(opts.pop("joins", None) or [])
+    for legacy in ("flash_cut", "word_caption_style", "caption_style_name", "caption_style"):
+        opts.pop(legacy, None)       # effects, flash and caption style now come only from the human edit choice
+    cap_src = edit_gates.caption_source(opts)
+    if choice and "captions" in choice["effects"] and not cap_src:
+        raise edit_gates.CaptionSourceError(edit_gates.MIC_REQUIRED)
+    if cap_src:
+        cap_src = {**cap_src, "media": cap_src["media"] or str(video), "start": start}
+    keep_opt_in = bool(opts.pop("keep_game_audio", False))
+    if opts.get("audio_mode") == "mix" and not keep_opt_in:
+        raise ValueError("game audio is stripped by default (phase 2.7); keeping it needs the --keep-game-audio opt-in")
     up_setting = upscale_setting(opts.pop("upscale", None))   # validate before spending time on the render
-    cmd_opts = {k: v for k, v in opts.items() if k != "caption_style_name"}
-    args = build_command(video, start, end, out_name, srt_name=srt_name, has_source_audio=has_audio(video), **cmd_opts)
+    args = build_command(video, start, end, out_name, has_source_audio=has_audio(video), **opts)
     subprocess.run(args, check=True, cwd=str(out_dir), env={**os.environ})
-    ed = edit_stage.apply(out_dir / out_name, style, joins=joins, flash=flash, word_style=word_style,
-                          energy_source=(video, start) if has_audio(video) else None)   # captions/effects
-    if ed.get("word_captions", "").startswith("BURNED"):
-        caption_status = ed["word_captions"]
-        opts["caption_style_name"] = ed["word_caption_style"]
+    pre = out_dir / (pathlib.Path(out_name).stem + ".preedit.mp4")
+    pre_rec = {}
+    if style != "off":
+        shutil.copy2(out_dir / out_name, pre)                     # pre-edit render (no captions/effects) for the overlay scan
+        pre_rec = {"pre_edit_file": pre.name, "pre_edit_sha256": edit_gates.sha256_bytes(pre)}
+        ed = edit_stage.apply(out_dir / out_name, choice, joins=joins, caption_source=cap_src,
+                              energy_source=(video, start) if has_audio(video) else None)   # captions/effects
+    else:
+        pre.unlink(missing_ok=True)                               # no stale pre-edit file from an older render
+        ed = {"edit_style": "off", "edit_effects": [], **({"edit_choice_by": choice["by"]} if choice else {})}
+    caption_status = ed["word_captions"] if str(ed.get("word_captions", "")).startswith("BURNED") else "OFF"
     up = upscale(out_dir / out_name, up_setting)                                                       # then upscale
-    return {**ed, **up, "layout": opts.get("layout", "blur"), "crop_x": round(float(opts.get("crop_x", 0.5)), 3),
+    return {**ed, **pre_rec, **up, "layout": opts.get("layout", "blur"), "crop_x": round(float(opts.get("crop_x", 0.5)), 3),
             "audio_mode": opts.get("audio_mode", "source"), "commentary_mixed": bool(opts.get("commentary")),
             "mic_source": (f"file:{pathlib.Path(opts['mic']).name}" if opts.get("mic") else
                            (f"stream:{opts['mic_stream']}" if opts.get("mic_stream") is not None else None)),
+            "mic_path": opts.get("mic") or None,
             "mic_gain": 1.0 if opts.get("audio_mode") in ("mic_stem", "mix") else None,
-            "game_audio": "stripped (opt-in)" if opts.get("audio_mode") == "mic_stem" else "kept",
+            "game_audio": "stripped (default)" if opts.get("audio_mode") == "mic_stem" else "kept",
+            "keep_game_audio_opt_in": opts.get("audio_mode") == "mix" and keep_opt_in,
             "music_volume": None if opts.get("audio_mode") == "mic_stem" else float(opts.get("game_volume", 1.0)),
-            "blur_regions": opts.get("blur_regions") or [], "caption_style": opts.get("caption_style_name"),
+            "blur_regions": opts.get("blur_regions") or [],
+            "caption_style": ed.get("word_caption_style") if caption_status != "OFF" else None,
             "captions": caption_status, "loudnorm": "I=-14 LUFS TP=-1.5 (single pass)"}
