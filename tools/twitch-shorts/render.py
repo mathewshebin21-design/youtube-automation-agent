@@ -6,9 +6,15 @@ Layouts:
   crop   - centre crop; --crop-x 0..1 moves the crop, or "smart" uses the motion centroid
   split  - facecam box on top, gameplay crop below (box given as fractions x,y,w,h of the source)
 Audio:
-  source    - keep the source mix (review candidates only; fails the music gate for upload)
-  mic_stem  - drop game/music audio; keep the creator's separate mic track at full level (never ducked
-              or muted) and add the voiceover/TTS track on top. The mic must be a separate stem:
+  Game audio is KEPT by default (Shebin, phase 2.8 override): mix = original game audio + the creator mic
+  stem at gain 1.0 + an optional voiceover/TTS on top. Stripping it (mic_stem) is the opt-in.
+  mix       - DEFAULT for upload renders: game audio (music volume, default 1.0 = unchanged) + the separate
+              creator mic stem at full level + optional voiceover; no ducking.
+  source    - the source audio only (+ optional voiceover on top); pipeline.py first render when no mic stem
+              is given. Fails live_reaction_preserved / original_commentary until a mic stem is added.
+  none      - video-only silent preview (no longer a default; kept for callers that want it)
+  mic_stem  - opt-in (--strip-game-audio): drop game/music audio; keep the creator's separate mic track at full
+              level (never ducked or muted) and add the voiceover/TTS track on top. The mic must be a separate stem:
               an OBS multitrack recording stream (--mic-stream N) or a mic file on the VOD timeline.
               Twitch VODs carry ONE mixed track, so the mic cannot be separated from them: fail closed.
 Always ends with loudnorm to about -14 LUFS (single pass) applied to the whole mix (no ducking).
@@ -100,17 +106,17 @@ def video_filter(layout, crop_x=0.5, facecam=None, facecam_height=640, blur_regi
     return pre + body
 
 
-AUDIO_MODES = ("source", "mix", "mic_stem")  # mix = default for commentary; mic_stem (game audio stripped) is opt-in
+AUDIO_MODES = ("source", "mix", "mic_stem")  # mix (game audio kept) = default; mic_stem (game audio stripped) is opt-in
 MUSIC_VOLUME_ENV = "CUTSCENECITY_MUSIC_VOLUME"
 
 
 def music_volume(value=None):
     """Game/music bed level. Default 1.0 = original audio unchanged; 0 < v < 1 lowers it under commentary.
-    Phase 2.7: commentary re-renders strip game audio by default (mic_stem); this level applies only with --keep-game-audio."""
+    Phase 2.8 override: game audio is kept by default (mix); this level is ignored only with --strip-game-audio."""
     raw = os.getenv(MUSIC_VOLUME_ENV, "1.0") if value is None else value
     v = float(raw)
     if not 0.0 < v <= 1.0:
-        raise ValueError("music volume must be > 0 and <= 1.0 (game audio is stripped by default; --keep-game-audio keeps it)")
+        raise ValueError("music volume must be > 0 and <= 1.0 (game audio is kept by default; --strip-game-audio removes it)")
     return v
 
 
@@ -161,6 +167,13 @@ def build_command(video, start, end, out_name, layout="blur", crop_x=0.5, faceca
     args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", str(start), "-i", str(video)]
     idx = 1
     mic_label = voice_label = None
+    if audio_mode == "none":
+        if commentary:
+            raise ValueError("audio_mode none is a silent preview: no commentary track")
+        args += ["-t", str(end - start), "-filter_complex", vf, "-map", "[v]", "-an"]
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-r", "30",
+                 "-movflags", "+faststart", out_name]
+        return args
     if audio_mode in ("mic_stem", "mix"):
         if mic:
             args += ["-ss", str(start), "-i", str(mic)]
@@ -288,9 +301,7 @@ def render(video, start, end, out_dir, out_name, captions=False, **opts):
         raise edit_gates.CaptionSourceError(edit_gates.MIC_REQUIRED)
     if cap_src:
         cap_src = {**cap_src, "media": cap_src["media"] or str(video), "start": start}
-    keep_opt_in = bool(opts.pop("keep_game_audio", False))
-    if opts.get("audio_mode") == "mix" and not keep_opt_in:
-        raise ValueError("game audio is stripped by default (phase 2.7); keeping it needs the --keep-game-audio opt-in")
+    opts.pop("keep_game_audio", None)       # phase 2.8 override: game audio is kept by default; accepted as a no-op
     up_setting = upscale_setting(opts.pop("upscale", None))   # validate before spending time on the render
     args = build_command(video, start, end, out_name, has_source_audio=has_audio(video), **opts)
     subprocess.run(args, check=True, cwd=str(out_dir), env={**os.environ})
@@ -304,6 +315,11 @@ def render(video, start, end, out_dir, out_name, captions=False, **opts):
     else:
         pre.unlink(missing_ok=True)                               # no stale pre-edit file from an older render
         ed = {"edit_style": "off", "edit_effects": [], **({"edit_choice_by": choice["by"]} if choice else {})}
+    words = ed.pop("_words", edit_stage._NOT_TRANSCRIBED)
+    if choice is not None and cap_src:                          # phase 2.8: audio profanity scan (+ bleep if chosen)
+        ed["profanity_audio"] = edit_stage.audio_profanity(out_dir / out_name, choice, cap_src, words=words)
+    elif choice is not None and choice.get("bleep", "off") != "off":
+        raise edit_gates.CaptionSourceError("bleep needs a separate creator mic stem to find the word timestamps")
     caption_status = ed["word_captions"] if str(ed.get("word_captions", "")).startswith("BURNED") else "OFF"
     up = upscale(out_dir / out_name, up_setting)                                                       # then upscale
     return {**ed, **pre_rec, **up, "layout": opts.get("layout", "blur"), "crop_x": round(float(opts.get("crop_x", 0.5)), 3),
@@ -312,9 +328,10 @@ def render(video, start, end, out_dir, out_name, captions=False, **opts):
                            (f"stream:{opts['mic_stream']}" if opts.get("mic_stream") is not None else None)),
             "mic_path": opts.get("mic") or None,
             "mic_gain": 1.0 if opts.get("audio_mode") in ("mic_stem", "mix") else None,
-            "game_audio": "stripped (default)" if opts.get("audio_mode") == "mic_stem" else "kept",
-            "keep_game_audio_opt_in": opts.get("audio_mode") == "mix" and keep_opt_in,
-            "music_volume": None if opts.get("audio_mode") == "mic_stem" else float(opts.get("game_volume", 1.0)),
+            "game_audio": ("stripped (--strip-game-audio opt-in)" if opts.get("audio_mode") == "mic_stem" else
+                           "none (silent preview)" if opts.get("audio_mode") == "none" else "kept (default)"),
+            "strip_game_audio_opt_in": opts.get("audio_mode") == "mic_stem",
+            "music_volume": None if opts.get("audio_mode") in ("mic_stem", "none") else float(opts.get("game_volume", 1.0)),
             "blur_regions": opts.get("blur_regions") or [],
             "caption_style": ed.get("word_caption_style") if caption_status != "OFF" else None,
             "captions": caption_status, "loudnorm": "I=-14 LUFS TP=-1.5 (single pass)"}

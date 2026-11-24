@@ -4,7 +4,7 @@
   python review.py set       --output output --clip short_01.mp4 --file clip-details.json
   python review.py precheck  --output output --clip short_01.mp4
   python review.py commentary --output output --clip short_01.mp4 --mic mic.wav|--mic-stream 1 [--audio voiceover.wav [--tts --voice-preset NAME]]
-  python review.py edit      --output output --clip short_01.mp4 --style off|clean|hype --effects captions,punch_in,... --by "Shebin" [--caption-style NAME] [--flash-intensity 0.5] [--no-render]
+  python review.py edit      --output output --clip short_01.mp4 --style off|clean|hype --effects captions,punch_in,... --by "Shebin" [--bleep off|tone|mute] [--caption-style NAME] [--flash-intensity 0.5] [--no-render]
   python review.py script    --output output --clip short_01.mp4 --file script.txt --by "Shebin" [--note "..."]
   python review.py signoff   --output output --clip short_01.mp4 --check no_story_cutscene --by "Shebin" --note "..."
   python review.py approve   --output output --clip short_01.mp4 --by "Shebin"
@@ -62,9 +62,10 @@ FIX_COMMANDS = {
     "transformation_note": "add \"transformation_note\" (25+ words, your own) to details.json, then: review.py set --clip {c} --file details.json --by NAME",
     "paid_promotion_declared": "suggested value 'none' (NOT declared yet): review.py paid --clip {c} --value none --by NAME  (or --value present)",
     "technical_qa": "re-render (pipeline.py --render or review.py commentary) so qa.py runs on the final file",
-    "original_commentary": "OBS mic track: review.py commentary --clip {c} --mic-stream N ; or mixed track: review.py signoff --clip {c} --check mixed_track_commentary_confirmed --by NAME --note \"<5+ words: live commentary audible>\"",
+    "original_commentary": "record an OBS multitrack (mic on its own track), then: review.py commentary --clip {c} --mic-stream N (or --mic FILE); there is no mixed-track bypass (phase 2.8)",
     "live_reaction_preserved": "same as original_commentary",
-    "mixed_track_commentary_confirmed": "review.py precheck --clip {c}; listen; review.py signoff --clip {c} --check mixed_track_commentary_confirmed --by NAME --note \"<5+ words>\"",
+    "profanity_audio_reviewed": "review.py edit --clip {c} --by NAME [--style ...] [--bleep tone|mute] (scans the mic stem), listen, then: review.py signoff --clip {c} --check profanity_audio_reviewed --by NAME --first-10s-full-mix-checked --note \"<5+ words if profanity found>\"",
+    "title_thumbnail_profanity_free": "remove strong profanity from metadata.title / metadata.thumbnail_text in details.json, then: review.py set --clip {c} --file details.json --by NAME",
     "commentary_script": "review.py script --clip {c} --file script.txt --by NAME",
     "captions_reviewed": "read {c} words.json against the video, then: review.py signoff --clip {c} --check captions_reviewed --by NAME --note \"<5+ words if flagged>\"",
     "style_rotation": "edits need a per-clip choice: review.py edit --clip {c} --style clean|hype --effects ... --by NAME",
@@ -114,8 +115,6 @@ def cmd_precheck(a, root, m, c_ctx):
     c["cutscene_scan"] = {"letterbox_ratio": compliance.letterbox_ratio(src, c["start"], c["end"]) if src else None,
                           "method": "letterbox heuristic; human sign-off still required"}
     c["fingerprint_precheck"] = compliance.fingerprint(root / c["file"])
-    if compliance.is_mixed_track(c):
-        c.setdefault("commentary", {})["mixed_track_speech_share"] = compliance.mixed_speech_share(root / c["file"])
     c["overlay_scan"] = overlay_precheck(root, c)
     compliance.evaluate(c, c_ctx)
     print(json.dumps({k: c[k] for k in ("cutscene_scan", "fingerprint_precheck", "overlay_scan")}, indent=2))
@@ -193,25 +192,33 @@ def cmd_commentary(a, root, m, c_ctx):
     src = source_video(root)
     if not src:
         raise SystemExit("source VOD not in output dir; cannot re-render with commentary")
-    if not a.mic and a.mic_stream is None:
+    has_mic = bool(a.mic) or a.mic_stream is not None
+    if not has_mic and not a.audio:
         raise SystemExit("a separate creator mic stem is required (--mic FILE on the VOD timeline, or --mic-stream N "
                          "for an OBS multitrack recording). Twitch VODs have one mixed track: failing closed.")
+    if a.strip_game_audio and not has_mic:
+        raise SystemExit("--strip-game-audio needs the creator mic stem (--mic FILE or --mic-stream N)")
     if a.tts and not a.voice_preset:
         raise SystemExit("--tts needs --voice-preset (rotation rule)")
     voice = pathlib.Path(a.audio).resolve() if a.audio else None
-    live_wav = commentary_bus(src, c["start"], c["end"], a.mic, a.mic_stream)
-    comb_wav = commentary_bus(src, c["start"], c["end"], a.mic, a.mic_stream, voice) if voice else live_wav
-    live, combined = compliance.speech_seconds(live_wav), compliance.speech_seconds(comb_wav)
-    for w in {live_wav, comb_wav}:
-        w.unlink(missing_ok=True)
+    if has_mic:
+        live_wav = commentary_bus(src, c["start"], c["end"], a.mic, a.mic_stream)
+        comb_wav = commentary_bus(src, c["start"], c["end"], a.mic, a.mic_stream, voice) if voice else live_wav
+        live, combined = compliance.speech_seconds(live_wav), compliance.speech_seconds(comb_wav)
+        for w in {live_wav, comb_wav}:
+            w.unlink(missing_ok=True)
+    else:
+        # voiceover/TTS only, no mic stem: renders (game audio + voiceover) for review, but the gates fail closed:
+        # original_commentary / live_reaction_preserved need the separate creator mic stem (no mixed-track bypass)
+        live, combined = 0.0, min(compliance.speech_seconds(voice), float(c["end"]) - float(c["start"]))
+    mode = "mic_stem" if a.strip_game_audio else ("mix" if has_mic else "source")
     if a.captions or a.edit_style not in (None, "off", "none"):
         raise SystemExit("phase 2.7: captions/edit style are a per-clip human choice: after this re-render run "
                          "review.py edit --clip ... --style ... --effects ... --by NAME (captions need this mic stem)")
     prev = c.get("render") or {}
     c["render"] = render.render(src, c["start"], c["end"], root, c["file"], captions=a.captions,
                                 layout=prev.get("layout", "blur"), crop_x=prev.get("crop_x", 0.5),
-                                facecam=prev.get("facecam"), audio_mode="mix" if a.keep_game_audio else "mic_stem",
-                                keep_game_audio=bool(a.keep_game_audio),
+                                facecam=prev.get("facecam"), audio_mode=mode,
                                 game_volume=render.music_volume(a.music_volume), commentary=str(voice) if voice else None,
                                 mic=a.mic, mic_stream=a.mic_stream, blur_regions=prev.get("blur_regions") or [],
                                 upscale=a.upscale, joins=c.get("joins") or [],
@@ -222,7 +229,7 @@ def cmd_commentary(a, root, m, c_ctx):
                        "speech_seconds_live": round(live, 2), "speech_seconds_combined": round(combined, 2),
                        "vad": "ffmpeg silencedetect energy VAD (-35 dB, 0.4 s) on the commentary bus",
                        "tts_used": bool(a.tts), "voice_preset": a.voice_preset if a.tts else None,
-                       "commentary_source": "mic_stem",
+                       "commentary_source": "mic_stem" if has_mic else None,
                        "sha256": gatelog.sha256_file(voice) if voice else None}
     if a.tts:
         c.setdefault("metadata", {})["containsSyntheticMedia"] = True  # (e) forced, not optional
@@ -234,7 +241,8 @@ def cmd_commentary(a, root, m, c_ctx):
 
 def recorded_choice(c):
     ec = c.get("edit_choice")
-    return {k: ec[k] for k in ("edit_style", "effects", "by", "flash_intensity_pct", "caption_style")} if ec else None
+    return ({**{k: ec[k] for k in ("edit_style", "effects", "by", "flash_intensity_pct", "caption_style")},
+             "bleep": ec.get("bleep") or "off"} if ec else None)
 
 
 def cmd_edit(a, root, m, c_ctx):
@@ -250,7 +258,8 @@ def cmd_edit(a, root, m, c_ctx):
         if a.flash_intensity is not None and a.flash_intensity > edit_gates.FLASH_MAX_INTENSITY:
             raise ValueError(f"flash intensity must be <= {edit_gates.FLASH_MAX_INTENSITY}")
         choice = edit_gates.validate_choice({"edit_style": a.style, "effects": effects, "by": a.by,
-                                             "flash_intensity_pct": pct, "caption_style": a.caption_style or ""})
+                                             "flash_intensity_pct": pct, "caption_style": a.caption_style or "",
+                                             "bleep": a.bleep or "off"})
     except ValueError as e:
         raise SystemExit(f"edit choice refused: {e}")
     if choice["caption_style"] and choice["caption_style"] not in render.edit_stage.WORD_STYLES:
@@ -259,10 +268,12 @@ def cmd_edit(a, root, m, c_ctx):
     if "captions" in choice["effects"] and prev.get("audio_mode") not in ("mix", "mic_stem"):
         raise SystemExit("edit choice refused: " + edit_gates.MIC_REQUIRED +
                          " (run review.py commentary --mic FILE | --mic-stream N first)")
+    if choice["bleep"] != "off" and prev.get("audio_mode") not in ("mix", "mic_stem"):
+        raise SystemExit("edit choice refused: --bleep needs the mic stem transcript (run review.py commentary first)")
     e = gatelog.append_review(root / "review_log.jsonl", action="edit_choice", by=choice["by"], clip=c["file"],
                               edit_style=choice["edit_style"], effects=choice["effects"],
                               flash_intensity_pct=choice["flash_intensity_pct"], caption_style=choice["caption_style"],
-                              note=a.note or "")
+                              bleep=choice["bleep"], note=a.note or "")
     c["edit_choice"] = {**choice, "at": e["at"], "log_seq": e["seq"]}
     if a.no_render:
         compliance.evaluate(c, c_ctx)
@@ -284,12 +295,10 @@ def cmd_edit(a, root, m, c_ctx):
             opts["mic"] = prev["mic_path"]
         else:
             raise SystemExit("previous render has no reusable mic stem: run review.py commentary --mic FILE again")
-        if (c.get("commentary") or {}).get("path"):
-            opts["commentary"] = c["commentary"]["path"]
-    if opts["audio_mode"] != "mic_stem":
+    if opts["audio_mode"] in ("mix", "mic_stem", "source") and (c.get("commentary") or {}).get("path"):
+        opts["commentary"] = c["commentary"]["path"]
+    if opts["audio_mode"] not in ("mic_stem", "none"):
         opts["game_volume"] = float(prev.get("music_volume") or 1.0)
-    if opts["audio_mode"] == "mix":
-        opts["keep_game_audio"] = bool(prev.get("keep_game_audio_opt_in"))
     try:
         c["render"] = render.render(src, c["start"], c["end"], root, c["file"], **opts)
     except ValueError as err:
@@ -297,13 +306,11 @@ def cmd_edit(a, root, m, c_ctx):
     for k in ("facecam", "profile"):
         c["render"][k] = prev.get(k)
     c["technical_qa"] = qa.validate(root / c["file"], c["start"], c["end"])
-    if compliance.is_mixed_track(c):
-        c.setdefault("commentary", {})["mixed_track_speech_share"] = compliance.mixed_speech_share(root / c["file"])
     reset_human_signoffs(c, "file re-rendered with a new edit choice")
     compliance.evaluate(c, c_ctx)
     print(json.dumps({"edit_choice": c["edit_choice"], "render": {k: c["render"].get(k) for k in (
         "edit_style", "edit_effects", "captions", "caption_source", "words_json", "caption_review", "zoom_count",
-        "flash_cuts", "pre_edit_file")}}, indent=2))
+        "flash_cuts", "pre_edit_file", "profanity_audio")}}, indent=2))
 
 
 def cmd_script(a, root, m, c_ctx):
@@ -362,9 +369,20 @@ def cmd_signoff(a, root, m, c_ctx):
     c = find(m, a.clip)
     if a.check == "overlays_third_parties_cleared" and (c.get("overlay_scan") or {}).get("file_sha256") != gatelog.sha256_file(root / c["file"]):
         raise SystemExit("overlay scan is missing or for an older render: run review.py precheck first")
-    if a.check == "mixed_track_commentary_confirmed" and len((a.note or "").split()) < 5:
-        raise SystemExit("mixed_track_commentary_confirmed needs --note with 5+ words saying the live commentary is audible")
     extra = {}
+    if a.check == "profanity_audio_reviewed":
+        pa = (c.get("render") or {}).get("profanity_audio")
+        problems = edit_gates.audio_profanity_problems(pa, c.get("edit_choice"), c_ctx.get("policy"))
+        if problems:
+            raise SystemExit("profanity_audio_reviewed refused: " + "; ".join(problems))
+        if edit_gates.all_hits(pa) and len((a.note or "").split()) < 5:
+            raise SystemExit("profanity_audio_reviewed: profanity was found in the audio; --note with 5+ words is required")
+        if not a.first_10s_full_mix_checked:
+            raise SystemExit("profanity_audio_reviewed: listen to the first 10 s of the FULL mix (game dialogue + voiceover "
+                             "+ mic) and pass --first-10s-full-mix-checked")
+        final_sha = gatelog.sha256_file(root / c["file"])
+        extra.update({"final_sha256": final_sha, "profanity_audio_sha256": edit_gates.sha256_record(pa),
+                      "first_10s_full_mix_checked": True})
     if a.check == "captions_reviewed":
         r = c.get("render") or {}
         wp = root / r["words_json"] if r.get("words_json") else None
@@ -378,9 +396,6 @@ def cmd_signoff(a, root, m, c_ctx):
                              "): --note with 5+ words is required")
         extra["words_json_sha256"] = r["words_json_sha256"]
     entry = compliance.signoff(c, a.check, a.by or "", a.note or "", c_ctx)
-    if a.check == "mixed_track_commentary_confirmed":
-        c.setdefault("commentary", {})["commentary_source"] = "mixed_track_signed"
-        compliance.evaluate(c, c_ctx)
     gatelog.append_review(root / "review_log.jsonl", action="signoff", check=a.check, by=entry["by"], note=entry["note"],
                           clip=c["file"], file_sha256=gatelog.sha256_file(root / c["file"]), **extra)
 
@@ -483,12 +498,18 @@ def main(argv=None):
     p.add_argument("--effects", help="edit: comma list of " + ",".join(edit_gates.EFFECTS) + " allowed for the style, or none")
     p.add_argument("--flash-intensity", type=float, default=None, help="edit: flash_cut intensity, > 0 and <= 0.5 (default 0.5)")
     p.add_argument("--no-render", action="store_true", help="edit: record the choice only (applied at the next re-render)")
+    p.add_argument("--first-10s-full-mix-checked", action="store_true",
+                   help="signoff profanity_audio_reviewed: I listened to the first 10 s of the full mix (phase 2.8.1)")
+    p.add_argument("--bleep", choices=edit_gates.BLEEP_MODES, default=None,
+                   help="edit: bleep strong profanity found in the mic stem: tone (1 kHz) | mute | off (default)")
     p.add_argument("--tts", action="store_true")
     p.add_argument("--music-volume", type=float, default=None,
                    help="game/music bed level 0<v<=1 (default env CUTSCENECITY_MUSIC_VOLUME or 1.0 = original audio unchanged)")
     p.add_argument("--upscale", default=None, help="commentary re-render: 2160 (default) | 1440 | off; env CUTSCENECITY_UPSCALE")
-    p.add_argument("--strip-game-audio", action="store_true", help="default since phase 2.7 (kept for old scripts; no effect)")
-    p.add_argument("--keep-game-audio", action="store_true", help="opt-in: keep game/music audio under the mic (audio_mode mix)")
+    p.add_argument("--strip-game-audio", action="store_true",
+                   help="opt-in: drop game/music audio, keep only the mic stem + voiceover (audio_mode mic_stem)")
+    p.add_argument("--keep-game-audio", action="store_true",
+                   help="default since the phase 2.8 override (game audio kept, audio_mode mix); accepted as a no-op")
     p.add_argument("--edit-style", default=None, help=argparse.SUPPRESS)   # phase 2.7: use review.py edit
     p.add_argument("--captions", action="store_true", help=argparse.SUPPRESS)  # phase 2.7: review.py edit --effects captions
     p.add_argument("--check")

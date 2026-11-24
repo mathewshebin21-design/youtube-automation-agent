@@ -105,6 +105,21 @@ def pre_edit_refusal(args):
     return None
 
 
+def first_render_audio(args):
+    """Phase 2.8 (Shebin override): the first render KEEPS the game audio.
+    With --mic FILE or --mic-stream N it renders audio_mode mix (game audio + the creator mic stem at gain 1.0).
+    With neither (e.g. a plain Twitch VOD, which has one mixed track) it renders the source audio (audio_mode source):
+    that preview fails live_reaction_preserved / original_commentary on purpose until review.py commentary
+    --mic|--mic-stream adds the separate creator mic stem (the 60% measurement and captions need it)."""
+    if args.mic:
+        return {"audio_mode": "mix", "mic": args.mic}
+    if args.mic_stream is not None:
+        return {"audio_mode": "mix", "mic_stream": args.mic_stream}
+    print("pipeline: no --mic/--mic-stream given: rendering with the source/game audio only (audio_mode source); "
+          "run review.py commentary --clip short_NN.mp4 --mic-stream N (or --mic FILE) before review", file=sys.stderr)
+    return {"audio_mode": "source"}
+
+
 def credit_line(owner, vod_url):
     """Factual attribution default from yt-dlp info.json fields only (no promo copy)."""
     login = (owner.get("uploader_id") or "").strip()
@@ -139,10 +154,14 @@ def main():
                         help="render this exact window (seconds in the input file) instead of auto-selection; repeatable")
     parser.add_argument("--join-adjacent", action="store_true", help="join two adjacent picks into one clip (<= 60 s total)")
     parser.add_argument("--flash-cut", action="store_true", help=argparse.SUPPRESS)  # moved to review.py edit --effects flash_cut
+    parser.add_argument("--mic", help="creator mic stem file on the VOD timeline (first render uses audio_mode mix: game audio kept + mic)")
+    parser.add_argument("--mic-stream", type=int, help="audio stream index of the creator mic in an OBS multitrack --input")
     args = parser.parse_args()
     refuse = pre_edit_refusal(args)
     if refuse:
         parser.error(refuse)
+    if args.mic and args.mic_stream is not None:
+        parser.error("use either --mic or --mic-stream, not both")
     if not 15 <= args.seconds <= 60:
         raise ValueError("--seconds must be 15-60")
     facecam = render.parse_box(args.facecam_box) if args.facecam_box else None
@@ -190,6 +209,7 @@ def main():
                 "selection_method": "weighted percentile ranks of " + ", ".join(selected[0]["signals_used"] if selected else ["motion"])
                 + " - heuristic, NOT gameplay understanding",
                 "publishing_allowed": False, "clips": []}
+    first_audio = first_render_audio(args)
     for index, row in enumerate(selected, 1):
         name = f"short_{index:02d}.mp4"
         clip = {"file": name, "start": row["start"], "end": row["end"], "motion_score": round(row["raw"]["motion_p75"], 2),
@@ -210,11 +230,11 @@ def main():
             clip["render"] = render.render(video, row["start"], row["end"], out, name,
                                            layout=args.layout, crop_x=crop_x, facecam=facecam,
                                            blur_regions=profile.get("blur_regions", []), upscale=args.upscale,
-                                           edit_style="off")   # pre-edit; edits: review.py edit (per-clip human choice)
+                                           edit_style="off", **first_audio)   # pre-edit; edits: review.py edit (human choice)
             clip["render"]["facecam"] = facecam
             clip["render"]["profile"] = args.profile
             clip["technical_qa"] = qa.validate(out / name, row["start"], row["end"])
-            clip["commentary"]["mixed_track_speech_share"] = compliance.mixed_speech_share(out / name)
+            clip["first_render_audio"] = first_audio["audio_mode"]
         compliance.evaluate(clip, {})
         manifest["clips"].append(clip)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))

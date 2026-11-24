@@ -1,5 +1,5 @@
 {
-  "version": 7,
+  "version": 8,
   "channel": "CutsceneCity",
   "twitch_channel": "cutscenecity",
   "youtube_handle": "@cutscenecity",
@@ -62,6 +62,8 @@
     168
   ],
   "min_commentary_coverage": 0.6,
+  "min_live_voice_coverage": 0.3,
+  "min_live_voice_note": "Phase 2.8.1: the creator live voice measured on the mic stem ONLY must cover >= 30% of runtime (hard floor; policy may only raise it). TTS/voiceover can top the total up to 60% but cannot replace the creator.",
   "daily_upload_cap": 1,
   "spoiler_keywords_file": "spoiler-keywords.txt",
   "upload_privacy": "private_only",
@@ -160,8 +162,8 @@
     ],
     "profanity_match": "case-insensitive prefix of each caption word (fuck -> fucking, fucked); masked as first letter + * (f******)",
     "profanity_warn_first_seconds": 10,
-    "audio_bleep": false,
-    "audio_bleep_note": "LIMITATION: only the burned caption text is masked. The audio is NOT bleeped; a human must decide whether the spoken profanity is acceptable (captions_reviewed).",
+    "audio_bleep": "per_clip_choice",
+    "audio_bleep_note": "Phase 2.8: the creator mic stem transcript is scanned for profanity_terms (render.profanity_audio, word timestamps in ms). The per-clip human edit choice can bleep them: review.py edit --bleep tone (1 kHz tone) | mute | off (default off). Strong profanity in the first profanity_warn_first_seconds blocks the clip unless bleeped. profanity_audio_reviewed (human) is pinned to the final file SHA-256. Captions are still masked as before.",
     "keyword_list_status": "PLACEHOLDER: Shebin/Compliance must replace the PLACEHOLDER_* entries with real story character names and plot keywords. Entries starting with PLACEHOLDER are ignored by the scan, and while any remain every caption review is flagged.",
     "story_names": [
       "Lucia",
@@ -174,7 +176,8 @@
       "PLACEHOLDER_PLOT_KEYWORD_1",
       "PLACEHOLDER_PLOT_KEYWORD_2"
     ],
-    "plot_keywords_note": "spoiler-defaults.json terms and spoiler-keywords.txt are scanned too (shared with the metadata spoiler gate)."
+    "plot_keywords_note": "spoiler-defaults.json terms and spoiler-keywords.txt are scanned too (shared with the metadata spoiler gate).",
+    "title_thumbnail_check": "Phase 2.8: metadata.title and metadata.thumbnail_text are checked against profanity_terms (auto gate title_thumbnail_profanity_free; Node re-checks)."
   },
   "edit_policy": {
     "default_edit_style": "clean",
@@ -197,8 +200,7 @@
     "flash_cut": "off by default; at most 1 per clip; intensity <= 0.5 (hard limits in edit.py and the Node gate)",
     "default_note": "Default per-clip choice is clean (captions only, mic stem required). hype is opt-in: review.py edit --style hype --effects ... --by NAME. Nothing is edited until a human records the choice (fix 7)."
   },
-  "game_audio_default": "stripped",
-  "game_audio_note": "Phase 2.7: commentary re-renders drop ALL game/music audio by default (audio_mode mic_stem). Keeping game audio is opt-in per render with review.py commentary --keep-game-audio (audio_mode mix, recorded as keep_game_audio_opt_in).",
-  "mixed_track_path_enabled": false,
-  "mixed_track_note": "Phase 2.7: a separate creator mic track is required. The mixed-track path (single Twitch VOD track + signed mixed_track_commentary_confirmed) is OFF by default; opt in with env CUTSCENECITY_ALLOW_MIXED_TRACK=true or this flag."
+  "game_audio_default": "kept",
+  "game_audio_note": "Phase 2.8 (Shebin override, 9:24 AM): game audio is KEPT by default. Upload renders are audio_mode mix = original game audio (music volume default 1.0) + the separate creator mic stem at gain 1.0 + optional voiceover/TTS on top; no ducking. Stripping game audio is the opt-in review.py commentary --strip-game-audio (audio_mode mic_stem). --keep-game-audio is accepted as a no-op. The mic stem is still required for the 60% commentary measurement and captions. Kept game audio may contain licensed radio/score: music_risk_cleared needs a whole-clip listen + note.",
+  "mixed_track_note": "Phase 2.8 (Compliance): the mixed-track bypass was REMOVED. A clip without a separate creator mic stem always fails original_commentary / live_reaction_preserved: commentary must be measured (60% of runtime) on the mic stem. The old opt-ins (env CUTSCENECITY_ALLOW_MIXED_TRACK, policy mixed_track_path_enabled) are ignored."
 }
