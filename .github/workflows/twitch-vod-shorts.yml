@@ -5,6 +5,11 @@ on:
       vod_url:
         description: URL of YOUR OWN Twitch VOD (https://www.twitch.tv/videos/<id>); no default
         required: true
+      enable_external_ai:
+        description: Explicitly authorize external Gemini processing and possible API charges
+        required: true
+        type: boolean
+        default: false
       render:
         description: Render review candidates
         required: true
@@ -35,6 +40,7 @@ jobs:
           if [ "$RENDER" = "true" ]; then args+=(--render); fi
           python tools/twitch-shorts/pipeline.py --url "$VOD_URL" --output output --limit 6 "${args[@]}"
       - name: Optional AI frame assessment (never authorizes publishing)
+        if: ${{ inputs.enable_external_ai }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python tools/twitch-shorts/visual_review.py --output output
@@ -47,5 +53,4 @@ jobs:
           name: twitch-shorts-review
           path: |
             output/manifest.json
-            output/short_*.mp4
           retention-days: 3
