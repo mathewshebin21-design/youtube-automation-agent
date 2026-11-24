@@ -30,7 +30,7 @@ One PR, still a draft, not merged:
 - Base: `master` @ `e973d51`
 - Created: 22 Nov 2026, 10:16 AM IST (`2026-11-22T04:46:21Z`)
 - Updated: 22 Nov 2026, 10:20 AM IST (`2026-11-22T04:50:52Z`)
-- Body (summary): yt-dlp / FFmpeg / OpenCV review-only pipeline and a manually triggered Actions workflow. Originally tied to VOD `2936544559`. No YouTube publishing in that PR. Motion scoring is a heuristic. Rights review and a real VOD test are still required before merge.
+- Body (summary): yt-dlp / FFmpeg / OpenCV review-only pipeline and a manually triggered Actions workflow. Originally tied to VOD `<VOD_ID>`. No YouTube publishing in that PR. Motion scoring is a heuristic. Rights review and a real VOD test are still required before merge.
 
 ### Local-only branches in `/workspace/gta6-automation/fork`
 
