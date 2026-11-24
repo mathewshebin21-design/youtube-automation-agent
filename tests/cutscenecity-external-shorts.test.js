@@ -252,6 +252,10 @@ test('Node re-checks gates independently: spoilers, TTS, script, live reaction, 
   assert.match(checkClipGates(clip, { ...opts, previous: { voice_preset: 'charon-relaxed' } }).join(' '), /repeats the previous upload/);
   const burned = { ...clip, render: { ...clip.render, captions: 'BURNED (test)', caption_style: 'bold-white' } };
   assert.match(checkClipGates(burned, { ...opts, previous: { caption_style: 'bold-white' } }).join(' '), /caption style bold-white repeats/);
+  const words = { ...clip, render: { ...clip.render, captions: 'BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK', caption_style: 'word-pop-yellow', edit_style: 'hype' } };
+  assert.doesNotMatch(checkClipGates(words, opts).join(' '), /caption style/);
+  assert.match(checkClipGates(words, { ...opts, previous: { caption_style: 'word-pop-yellow' } }).join(' '), /caption style word-pop-yellow repeats/);
+  assert.match(checkClipGates({ ...words, render: { ...words.render, caption_style: 'word-pop-rainbow' } }, opts).join(' '), /not in policy/);
   assert.match(checkClipGates({ ...clip, commentary: { ...clip.commentary, voice_preset: 'robot' } }, opts).join(' '), /not in policy/);
   const noCredit = { ...clip, metadata: { ...clip.metadata, description: 'no credit here' } };
   assert.match(checkClipGates(noCredit, opts).join(' '), /attribution/);

@@ -12,6 +12,7 @@ from unittest import mock
 
 HERE = pathlib.Path(__file__).parent
 sys.path.insert(0, str(HERE))
+os.environ.setdefault("CUTSCENECITY_EDIT_STYLE", "off")  # keep the suite fast; EditStage tests cover the hype default
 os.environ.setdefault("CUTSCENECITY_UPSCALE", "off")  # keep the suite fast; Upscale tests cover the 2160 default
 import compliance  # noqa: E402
 import gatelog  # noqa: E402
@@ -904,3 +905,92 @@ class Workflow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import edit  # noqa: E402
+import pipeline  # noqa: E402
+import qa  # noqa: E402
+
+
+def audio_md5(path):
+    p = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a", "-c", "copy", "-f", "md5", "-"],
+                       capture_output=True, text=True, check=True)
+    return p.stdout.strip()
+
+
+WORDS = [{"word": w, "start": 1.0 + i * 0.45, "end": 1.35 + i * 0.45}
+         for i, w in enumerate("Oh no he's flanking left watch out bro that was close".split())]
+
+
+class EditStage(unittest.TestCase):
+    def test_default_is_hype_and_controls(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CUTSCENECITY_EDIT_STYLE", None)
+            self.assertEqual(edit.edit_style(), "hype")
+        with mock.patch.dict(os.environ, {"CUTSCENECITY_EDIT_STYLE": "clean"}):
+            self.assertEqual(edit.edit_style(), "clean")
+            self.assertEqual(edit.edit_style("off"), "off")              # flag beats env
+        with self.assertRaises(ValueError):
+            edit.edit_style("wild")
+
+    def test_captions_are_exact_transcript_words(self):
+        ass = edit.build_ass(WORDS, 12.0)
+        self.assertEqual(edit.ass_words(ass), [w["word"] for w in WORDS])
+        self.assertIn(f",{edit.CAPTION_MARGIN_V},1", ass)                 # MarginV above the bottom 15%
+        self.assertGreater(edit.CAPTION_MARGIN_V, 0.15 * 1920)
+        self.assertIn("\\c&H00FFFF&\\fscx130\\fscy130\\t(0,120,\\fscx100\\fscy100)", ass)   # yellow pop on the current word
+        self.assertIn(",-1,0,0,0,100,100,0,0,1,6,", ass)                  # bold, outline 6, black outline colour
+        self.assertEqual(edit.ass_words(edit.build_ass([{"word": "a{b}\\c", "start": 1, "end": 2}], 5)), ["abc"])
+        self.assertEqual(edit.build_ass([], 5).count("Dialogue:"), 0)
+
+    def test_zoom_count_limit(self):
+        db = [-40.0] * 300                     # 30 s at 0.1 s hops
+        for i in range(10, 290, 7):            # a spike every 0.7 s
+            db[i] = -10.0
+        p = edit.spikes(db, duration=30.0)
+        times = [x["t"] for x in p]
+        self.assertTrue(p)
+        self.assertTrue(all(b - a >= edit.MIN_GAP for a, b in zip(times, times[1:])), times)
+        self.assertLessEqual(len(p), int(30 / edit.MIN_GAP) + 1)
+        self.assertGreaterEqual(min(times), edit.HOOK_SECONDS)
+        self.assertIn(sum(x["shake"] for x in p), (1, 2))
+        self.assertEqual(edit.spikes([-30.0] * 300, duration=30.0), [])  # flat audio: no zooms
+        g = edit.video_graph("hype", 30.0, p, "x.ass")
+        self.assertIn("zoompan=", g)
+        self.assertIn("drawbox=x=0:y=ih-", g)
+        self.assertIn("fade=t=out:st=29.700", g)
+        self.assertNotIn("color=white@0.85", g)                            # flash cut off by default
+        self.assertIn("color=white@0.85", edit.video_graph("hype", 30.0, p, None, joins=[15.0], flash=True))
+        self.assertEqual(edit.video_graph("clean", 30.0, p, "x.ass"), "[0:v]fps=30,setsar=1,ass=x.ass[v]")
+        with self.assertRaises(ValueError):
+            edit.video_graph("clean", 30.0, [], "x';evil.ass")
+
+    def test_pipeline_windows_and_joins(self):
+        rows = pipeline.manual_windows(["0-30", "30-60"], 100)
+        self.assertEqual([(r["start"], r["end"]) for r in rows], [(0, 30), (30, 60)])
+        joined = pipeline.join_adjacent(rows)
+        self.assertEqual((joined[0]["start"], joined[0]["end"], joined[0]["joins"]), (0, 60, [30]))
+        self.assertEqual(len(pipeline.join_adjacent(pipeline.manual_windows(["0-40", "40-80"], 100))), 2)   # > 60 s: not joined
+        with self.assertRaises(ValueError):
+            pipeline.manual_windows(["0-10"], 100)
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
+    def test_render_hype_then_upscale_audio_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            vod = d / "vod.mp4"
+            make_vod(vod, seconds=50)          # loud burst at 40-46 s
+            with mock.patch.object(edit, "transcribe_words", return_value=WORDS):
+                hype = render.render(vod, 28, 48, d, "hype.mp4", layout="blur", edit_style="hype", upscale="1440")
+            plain = render.render(vod, 28, 48, d, "plain.mp4", layout="blur", edit_style="off", upscale="1440")
+            self.assertEqual(audio_md5(d / "hype.mp4"), audio_md5(d / "plain.mp4"))     # edit + upscale never touch audio
+            self.assertEqual(render.video_size(d / "hype.mp4"), (1440, 2560))           # edit ran before upscale
+            self.assertEqual((hype["edit_style"], hype["upscale"]), ("hype", "1440"))
+            self.assertEqual(hype["captions"], "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK")
+            self.assertEqual(hype["caption_style"], "word-pop-yellow")
+            self.assertGreaterEqual(hype["zoom_count"], 1)
+            self.assertLessEqual(hype["zoom_count"], int(20 / edit.MIN_GAP) + 1)
+            self.assertEqual(edit.ass_words((d / "hype.words.ass").read_text()), [w["word"] for w in WORDS])
+            self.assertEqual(qa.validate(d / "hype.mp4", 28, 48)["status"], "PASS_TECHNICAL_ONLY")
+            self.assertEqual(plain["edit_style"], "off")
+            self.assertNotIn("zoom_count", plain)
