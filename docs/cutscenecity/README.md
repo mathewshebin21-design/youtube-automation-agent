@@ -39,8 +39,12 @@ Twitch VOD (own) / OBS multitrack recording
 | (2.7 fixes) | 2.7 | Compliance fixes 1-8: per-clip signed edit choice, mic-stem-only captions, `captions_reviewed` bound to words.json, profanity masking + first-10s flag, caption keyword scan, pre-edit overlay scan, flash ≤ 1 at ≤ 0.5 |
 | (2.7 defaults) | 2.7 | Game audio stripped by default (`--keep-game-audio` opt-in), separate mic required (mixed-track opt-in `CUTSCENECITY_ALLOW_MIXED_TRACK`), hard daily cap 1, default edit choice `clean` (hype opt-in) |
 | (2.7 docs) | 2.7 | This `docs/cutscenecity/` handover |
+| (2.8) | 2.8 | Mixed-track bypass removed, first render `mic_stem` (superseded by the next row), audio-profanity gate (`profanity_audio_reviewed`, optional bleep, first-10 s block, clean title/thumbnail), music wording fix, VOD ids scrubbed |
+| (2.8.1) | 2.8.1 | Live-voice floor 30% on the mic stem only, independent music-note re-check (verify_package + Node), full-mix profanity scan + signed first-10s full-mix confirmation, stale mixed-track docs fixed |
+| (2.8 game audio) | 2.8 | Shebin's override: game audio KEPT by default (`mix`: game + mic at 1.0 + optional voiceover), `--strip-game-audio` opt-in, `--keep-game-audio` no-op, first render keeps game audio, music_risk wording |
+| (2.8 workflow) | 2.8 | Separate, droppable commit: the review workflow no longer uploads `output/short_*.mp4` / manifest artifacts |
 
-Remote state, as last known: `origin/cutscenecity-phase1-tweaks` was at 9ffcb12 (phases up to 2.5). UNVERIFIED now; nothing from 2.6 or 2.7 has been pushed. Which commit hashes belong to what is in `/workspace/gta6-automation/patches/push-manifest-2.7.txt` (box only).
+Remote state, as last known: `origin/cutscenecity-phase1-tweaks` at 9ffcb12 (phases up to 2.5); `cutscenecity-phase2.6-hype` and `cutscenecity-phase2.7-compliance` were pushed with Shebin's approval. Phase 2.8 is local only. Which commit hashes belong to what is in `/workspace/gta6-automation/patches/push-manifest-2.7.txt` (box only).
 
 ## How to run
 ```bash
@@ -51,9 +55,10 @@ python -m unittest discover -s tools/twitch-shorts -p "test_*.py"
 
 # one clip, end to end (local, private)
 export CUTSCENECITY_OWNER_TWITCH_LOGIN=cutscenecity CUTSCENECITY_REVIEW_KEY=<32+ random chars, never commit>
-python tools/twitch-shorts/pipeline.py --input rec.mkv --info-json vod.info.json --render --window 585-615 --output out
-python tools/twitch-shorts/review.py commentary --output out --clip short_01.mp4 --mic-stream 1      # game audio stripped
-python tools/twitch-shorts/review.py edit       --output out --clip short_01.mp4 --by Shebin          # default clean + captions
+python tools/twitch-shorts/pipeline.py --input rec.mkv --info-json vod.info.json --render --window 585-615 --mic-stream 1 --output out  # first render = game audio + mic stem
+python tools/twitch-shorts/review.py commentary --output out --clip short_01.mp4 --mic-stream 1      # game audio kept (add --audio VO.wav for a voiceover, --strip-game-audio to drop it)
+python tools/twitch-shorts/review.py edit       --output out --clip short_01.mp4 --by Shebin          # default clean + captions; scans mic audio for profanity
+                                                                        # add --bleep tone|mute to bleep flagged words (required if any are in the first 10 s)
 python tools/twitch-shorts/review.py precheck   --output out --clip short_01.mp4                      # overlay scan on the pre-edit render
 python tools/twitch-shorts/review.py status     --output out --clip short_01.mp4                      # what is still blocking + fix commands
 python tools/twitch-shorts/review.py signoff    --output out --clip short_01.mp4 --check <gate> --by Shebin --note "..."
@@ -71,9 +76,9 @@ See `GATES.md` (generated from `compliance.CHECKS`), and `OBS-MULTITRACK.md` for
 - `CUTSCENECITY-PHASE1.md`: the long phase 1 to 2.3 guide (audit findings, setup, OAuth Desktop flow). **Its cap and default-audio statements are out of date**; the code and the 2.7 sections of `tools/twitch-shorts/README.md` are authoritative.
 - `youtube-api-audit/`: a DRAFT YouTube API audit/quota package. Not submitted; Shebin decides.
 
-## Open items (as of phase 2.7)
+## Open items (as of phase 2.8.1)
 - Shebin still has to confirm the 2.7 defaults with the coordinator (GTA6 YouTube Automator), and Compliance still has to review the 2.7 patch. 2.6 `hype` stays recoverable at 02c223c.
 - `caption_policy.story_names` / `plot_keywords` hold PLACEHOLDER entries that Shebin or Compliance must fill in. Until then every caption review is flagged.
-- Masked profanity is **not** bleeped in the audio (a documented limitation).
+- Phase 2.8: audio profanity is scanned and can be bleeped per clip (`--bleep tone|mute`); obfuscated spellings and misheard words are not caught.
 - Compliance's conditional pass covers ONE private test only. Conditions: gameplay only, no Twitch-muted ranges, all sign-offs done, a 25+ word transformation note, the clean edit, and waiting for Studio Checks before any publish decision.
 - The 12 "final" shorts rendered under 2.6 (outside the repo) keep game audio and some contain cutscenes and dialogue, so they do NOT meet these conditions.
