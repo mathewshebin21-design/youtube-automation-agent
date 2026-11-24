@@ -34,7 +34,7 @@ DEFAULT_SPOILERS = json.loads((pathlib.Path(__file__).parent / "spoiler-defaults
 
 def register_check(name, kind="auto", description="", applies=None):
     """applies(clip) -> bool: a human check that does not apply to this clip is recorded as PASS/not_applicable
-    and needs no signature (e.g. mixed_track_commentary_confirmed when a mic stem exists)."""
+    and needs no signature (e.g. captions_reviewed when no captions are burned)."""
     if kind not in ("auto", "human"):
         raise ValueError("kind must be auto or human")
 
@@ -185,17 +185,27 @@ def fingerprint(path):
 
 
 @register_check("music_risk_cleared", "human",
-                "Game audio is kept by default (mix, music volume adjustable); a person listens for licensed "
-                "music/radio (Content ID risk) and signs off; fingerprint pre-check result attached.")
+                "Game audio is KEPT by default (audio_mode mix: original game audio, which can include licensed in-game "
+                "radio or score, plus the creator mic and any voiceover). A person listens to the WHOLE final file for "
+                "licensed music/radio (Content ID risk) and signs off with a 5+ word note; fingerprint pre-check result "
+                "attached. If licensed music is audible: re-render with --strip-game-audio (mic_stem) or pick another "
+                "window.")
 def music_hint(clip, ctx):
     render = clip.get("render") or {}
     fp = clip.get("fingerprint_precheck")
     if not fp:
         return FAIL, "run the fingerprint pre-check (review.py precheck) before signing off"
-    if render.get("audio_mode") != "mic_stem":
-        return WARN, (f"original game audio kept (music volume {render.get('music_volume', 1.0)}); licensed in-game radio "
-                      f"may trigger Content ID: listen to the whole clip, fingerprint {fp.get('status')}; note required")
-    return WARN, f"game/music audio dropped; fingerprint {fp.get('status')}: listen for music picked up by the mic"
+    mode = render.get("audio_mode")
+    if mode in ("mix", "source"):
+        return WARN, (f"game audio KEPT (default, music volume {render.get('music_volume', 1.0)}): in-game radio/score "
+                      f"may be licensed music (Content ID): listen to the whole clip, fingerprint {fp.get('status')} "
+                      "(a local pre-check, not Content ID); note required. Licensed music audible: re-render with "
+                      "--strip-game-audio or choose another window")
+    if mode == "mic_stem":
+        return WARN, (f"game audio stripped (--strip-game-audio opt-in): only the creator mic + voiceover are in the "
+                      f"final mix; fingerprint {fp.get('status')}: listen for music picked up by the mic; note required")
+    return FAIL, (f"audio_mode {mode!r} is not an upload mix (no audio / no creator mic stem): re-render with "
+                  "review.py commentary --mic-stream N | --mic FILE")
 
 
 # ---------- third-party overlays (chat, alerts, usernames, viewer TTS, guest audio) ----------
@@ -221,7 +231,8 @@ def _captions_burned(clip):
 
 @register_check("captions_reviewed", "human",
                 "A person read the burned captions (the exact words.json, SHA-256 bound) against the final file: words "
-                "are right, strong profanity is masked (audio is NOT bleeped), no story names or plot dialogue.",
+                "are right, strong profanity is masked, no story names or plot dialogue. (Audio profanity is the separate "
+                "profanity_audio_reviewed check.)",
                 applies=_captions_burned)
 def captions_hint(clip, ctx):
     import edit_gates
@@ -237,6 +248,43 @@ def captions_hint(clip, ctx):
     if reasons:
         return WARN, "; ".join(reasons) + " (note required)"
     return PASS, "no caption flags (human review still required)"
+
+
+# ---------- phase 2.8: audio profanity (mic stem) + clean title / thumbnail text ----------
+@register_check("profanity_audio_reviewed", "human",
+                "A person listened to the final file for strong profanity. The mic stem transcript is scanned against "
+                "caption_policy.profanity_terms; flagged words can be bleeped (review.py edit --bleep tone|mute: 1 kHz "
+                "tone or mute over the word timestamps). Strong profanity in the first 10 s blocks unless bleeped. The "
+                "signed sign-off is pinned to the final file SHA-256 and the profanity_audio record hash; a note of 5+ "
+                "words is required when anything was found. Phase 2.8.1: the FULL final mix (game dialogue, voiceover) "
+                "is transcribed and scanned too, and the sign-off must confirm the first 10 s of the full mix were "
+                "listened to (--first-10s-full-mix-checked).")
+def profanity_audio_hint(clip, ctx):
+    import edit_gates
+    pa = (clip.get("render") or {}).get("profanity_audio")
+    problems = edit_gates.audio_profanity_problems(pa, clip.get("edit_choice"), ctx.get("policy"))
+    if problems:
+        return FAIL, "; ".join(problems)
+    st = edit_gates.audio_profanity_state(pa, ctx.get("policy"))
+    if st["hit_count"]:
+        return WARN, (f"{st['hit_count']} strong profanity word(s) (mic + full mix) at "
+                      f"{sorted({h['start_ms'] for h in edit_gates.all_hits(pa)})} ms (bleep={pa.get('bleep')}, still "
+                      f"audible at {st['unbleeped_ms']} ms): listen, note required")
+    return PASS, ("no strong profanity in the mic stem or full-mix transcripts (a person still listens to the final file, "
+                  "first 10 s of the full mix confirmed in the sign-off)")
+
+
+@register_check("title_thumbnail_profanity_free", "auto",
+                "Title and thumbnail text (package metadata: metadata.title, metadata.thumbnail_text) contain no strong "
+                "profanity from caption_policy.profanity_terms.")
+def title_thumbnail_gate(clip, ctx):
+    import edit_gates
+    md = clip.get("metadata") or {}
+    hits = edit_gates.text_profanity({"title": md.get("title", ""), "thumbnail_text": md.get("thumbnail_text", "")},
+                                     ctx.get("policy"))
+    if hits:
+        return FAIL, "strong profanity in " + "; ".join(f"{k}: {', '.join(v)}" for k, v in sorted(hits.items()))
+    return PASS, "title and thumbnail text are clean (profanity list)"
 
 
 # ---------- paid promotion (videos.insert paidProductPlacementDetails) ----------
@@ -266,68 +314,40 @@ def speech_seconds(audio_path, noise_db=-35, min_silence=0.4):
     return max(0.0, total - silent)
 
 
-def mixed_speech_share(media, start=None, end=None):
-    """HINT ONLY: share of the clip where the mixed VOD track has voice-band energy (300-3400 Hz energy VAD).
-    Game voices, cutscene dialogue and music count as speech too, so this can never pass a gate on its own."""
-    args = ["ffmpeg", "-hide_banner"]
-    if start is not None:
-        args += ["-ss", str(start), "-t", str(float(end) - float(start))]
-    args += ["-i", str(media), "-vn", "-af", "highpass=f=300,lowpass=f=3400,silencedetect=noise=-30dB:d=0.3", "-f", "null", "-"]
-    p = subprocess.run(args, capture_output=True, text=True)
-    dur = (float(end) - float(start)) if start is not None else None
-    if dur is None:
-        m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", p.stderr)
-        if not m:
-            return None
-        dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-    if p.returncode != 0 or dur <= 0:
-        return None
-    silent = sum(float(x) for x in re.findall(r"silence_duration: ([\d.]+)", p.stderr))
-    return round(max(0.0, min(1.0, (dur - silent) / dur)), 3)
-
-
 def is_mixed_track(clip):
     """No separate creator mic stem: commentary is only in the single mixed VOD track."""
     return not (clip.get("commentary") or {}).get("mic_source") and not (clip.get("render") or {}).get("mic_source")
 
 
-def mixed_track_signed(clip):
-    return (is_mixed_track(clip) and owner_ok(clip)
-            and (clip.get("compliance") or {}).get("mixed_track_commentary_confirmed", {}).get("status") == PASS
-            and not clip["compliance"]["mixed_track_commentary_confirmed"].get("not_applicable"))
+MIXED_REMOVED = ("no separate creator mic stem: commentary must be MEASURED (60% of runtime, energy VAD) on a creator "
+                 "mic stem. The mixed-track bypass was removed in phase 2.8: CUTSCENECITY_ALLOW_MIXED_TRACK and policy "
+                 "mixed_track_path_enabled are ignored. Record an OBS multitrack and run review.py commentary --mic-stream N "
+                 "(or --mic FILE)")
 
 
-MIXED_ENV = "CUTSCENECITY_ALLOW_MIXED_TRACK"
-MIXED_OFF = ("separate mic track required: the mixed-track path is OFF by default (phase 2.7); record an OBS multitrack "
-             "and run review.py commentary --mic-stream N, or opt in with CUTSCENECITY_ALLOW_MIXED_TRACK=true")
+MIN_LIVE_VOICE = 0.30   # phase 2.8.1: creator live voice (mic stem only) floor; policy may only raise it
+MUSIC_NOTE_WORDS = 5    # phase 2.8.1: music_risk_cleared note length whenever game/source audio is in the final mix
 
 
-def mixed_track_allowed(ctx=None, env=None):
-    """Phase 2.7: the mixed-track path is opt-in (env CUTSCENECITY_ALLOW_MIXED_TRACK=true or policy mixed_track_path_enabled)."""
-    env = os.environ if env is None else env
-    if str(env.get(MIXED_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
-        return True
-    return bool(((ctx or {}).get("policy") or {}).get("mixed_track_path_enabled", False))
+def live_voice_coverage(clip):
+    c = clip.get("commentary") or {}
+    runtime = float(clip["end"]) - float(clip["start"])
+    if not c.get("mic_source") or runtime <= 0:
+        return 0.0
+    return float(c.get("speech_seconds_live") or 0) / runtime
 
 
-def owner_ok(clip):
-    return creator_owned_source(clip, {"policy": None})[0] == PASS
-
-
-@register_check("mixed_track_commentary_confirmed", "human",
-                "Mixed-track path (no mic stem; Twitch VOD has one mixed track): a person listened to the whole clip and "
-                "confirms the creator's live commentary is clearly audible over the game audio. Note of 5+ words required.",
-                applies=is_mixed_track)
-def mixed_track_hint(clip, ctx):
-    if not mixed_track_allowed(ctx):
-        return FAIL, MIXED_OFF
-    if not owner_ok(clip):
-        return FAIL, "mixed-track path is only for creator-owned VODs (creator_owned_source must pass)"
-    share = (clip.get("commentary") or {}).get("mixed_track_speech_share")
-    if share is None:
-        return WARN, "no speech hint yet (review.py precheck); listen to the whole clip; note required"
-    return WARN, (f"voice-band activity in {share:.0%} of the clip (hint only: game voices/music count too); "
-                  "confirm YOUR live commentary is audible; note required")
+def music_note_problem(clip, entries, file_sha):
+    """Independent re-check (verify_package; Node mirrors it): when game/source audio is in the final mix
+    (audio_mode mix or source), the signed music_risk_cleared sign-off for this file needs a 5+ word note."""
+    if (clip.get("render") or {}).get("audio_mode") not in ("mix", "source"):
+        return None
+    so = [e for e in entries if e.get("action") == "signoff" and e.get("check") == "music_risk_cleared"
+          and e.get("clip") == clip.get("file") and e.get("file_sha256") == file_sha]
+    if not so or len(str(so[-1].get("note") or "").split()) < MUSIC_NOTE_WORDS:
+        return ("music_risk_cleared: game/source audio is in the final mix; the signed sign-off needs a note of "
+                f"{MUSIC_NOTE_WORDS}+ words (whole-clip listen for licensed music)")
+    return None
 
 
 def tts_counts(env=None):
@@ -336,52 +356,40 @@ def tts_counts(env=None):
 
 
 @register_check("original_commentary", "auto",
-                "Creator mic + voiceover/TTS (energy VAD on the combined commentary bus) covers at least 60% of runtime. "
-                "TTS counts only when CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY is on (default) and containsSyntheticMedia is true.")
+                "Creator mic + voiceover/TTS (energy VAD on the combined commentary bus) covers at least 60% of runtime, "
+                "AND the creator's live voice alone (mic stem only) covers at least 30% (phase 2.8.1 floor: TTS can top "
+                "up to 60% but never replaces the creator). TTS counts only when CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY "
+                "is on (default) and containsSyntheticMedia is true.")
 def commentary_gate(clip, ctx):
     c = clip.get("commentary") or {}
     if not c.get("mic_source"):
-        if not owner_ok(clip):
-            return FAIL, "no creator mic stem and the VOD is not creator-owned"
-        if not mixed_track_allowed(ctx):
-            return FAIL, MIXED_OFF
-        if mixed_track_signed(clip):
-            return PASS, "mixed_track_signed: reviewer confirmed live commentary is audible (no mic stem to measure)"
-        share = c.get("mixed_track_speech_share")
-        hint = f"; voice-band hint {share:.0%} (game voices count too)" if share is not None else ""
-        return WARN, ("no mic stem: commentary cannot be measured on the single mixed track" + hint +
-                      ". Sign mixed_track_commentary_confirmed, or attach an OBS mic track (review.py commentary --mic-stream N)")
+        return FAIL, MIXED_REMOVED
     if c.get("tts_used") and (clip.get("metadata") or {}).get("containsSyntheticMedia") is not True:
         return FAIL, "TTS used: containsSyntheticMedia must be true"
     runtime = float(clip["end"]) - float(clip["start"])
+    live_cov = live_voice_coverage(clip)
+    floor = ctx.get("min_live_voice", MIN_LIVE_VOICE)
+    if live_cov < floor:
+        return FAIL, (f"creator live voice (mic stem only) covers {live_cov:.0%} of runtime; at least {floor:.0%} is "
+                      "required (TTS/voiceover cannot replace the creator)")
     counts = tts_counts(ctx.get("env"))
     speech = float(c.get("speech_seconds_combined" if counts else "speech_seconds_live", 0) or 0)
     cov = speech / runtime if runtime > 0 else 0
     label = "live voice + TTS" if counts else "live voice only (TTS not counted)"
     if cov < ctx.get("min_commentary", 0.60):
-        return FAIL, f"{label} covers {cov:.0%} of runtime; 60% required"
-    return PASS, f"{label} covers {cov:.0%} of runtime"
+        return FAIL, f"{label} covers {cov:.0%} of runtime; 60% required (live voice alone {live_cov:.0%})"
+    return PASS, f"{label} covers {cov:.0%} of runtime (live voice alone {live_cov:.0%})"
 
 
 @register_check("live_reaction_preserved", "auto",
                 "The creator's real mic/reaction track is in the final mix at full level (never muted or ducked).")
 def live_reaction_gate(clip, ctx):
     r = clip.get("render") or {}
-    if is_mixed_track(clip) and r.get("audio_mode", "source") == "source" and owner_ok(clip):
-        if not mixed_track_allowed(ctx):
-            return FAIL, MIXED_OFF
-        if r.get("music_volume", 1.0) != 1.0:
-            return FAIL, "mixed track was lowered (music volume < 1.0 also lowers the creator voice in a mixed track)"
-        if mixed_track_signed(clip):
-            return PASS, "mixed_track_signed: original mixed track (creator voice included) kept at full level"
-        return WARN, "single mixed VOD track kept at full level; sign mixed_track_commentary_confirmed (voice audible)"
     if r.get("audio_mode") not in ("mix", "mic_stem") or not r.get("mic_source"):
         return FAIL, ("no separate creator mic stem in the final mix; Twitch VODs have one mixed track, so the mic "
                       "cannot be separated: record an OBS multitrack (mic on its own track) and pass --mic-stream/--mic")
     if r.get("mic_gain") != 1.0:
         return FAIL, "creator mic was lowered"
-    if r.get("audio_mode") == "mix" and r.get("keep_game_audio_opt_in") is not True:
-        return FAIL, "game audio kept without the --keep-game-audio opt-in (game audio is stripped by default)"
     return PASS, f"creator mic {r['mic_source']} kept at full level"
 
 
@@ -452,6 +460,7 @@ def build_ctx(pol, here):
     import script_checks
     spoiler = pol.get("spoiler_keywords_file")
     return {"min_commentary": max(0.60, float(pol.get("min_commentary_coverage", 0.60))),
+            "min_live_voice": max(MIN_LIVE_VOICE, float(pol.get("min_live_voice_coverage", MIN_LIVE_VOICE))),
             "spoiler_file": str(pathlib.Path(here) / spoiler) if spoiler else None, "policy": pol,
             "script_history": script_checks.read_history(), "previous_upload": script_checks.previous_upload()}
 

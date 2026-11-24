@@ -10,8 +10,10 @@ Styles (phase 2.7: default choice "clean", hype opt-in; applied only through a p
 The human picks the style AND the effects list per clip; apply() refuses to edit without that recorded choice.
 Captions are transcribed ONLY from a separate creator mic stem (never the mixed Twitch/game track), strong
 profanity is masked (f******) and caption text is scanned for story names / plot keywords (edit_gates.py).
-Audio is never touched: the edit pass copies the audio stream (-c:a copy). LIMITATION: masked words are NOT
-bleeped in the audio.
+The caption/effects pass copies the audio stream (-c:a copy). Phase 2.8: audio_profanity() scans the mic stem
+transcript for the same profanity list and, only when the human edit choice says bleep=tone|mute, re-encodes the
+final audio with a 1 kHz tone / silence over the flagged word timestamps (+/- 50 ms). With bleep=off the audio is
+unchanged and strong profanity in the first 10 s blocks the clip (edit_gates.audio_profanity_problems).
 """
 import json
 import os
@@ -289,6 +291,7 @@ def apply(path, choice, joins=(), model=None, energy_source=None, caption_source
         words = transcribe_words(src["media"], model, start=src.get("start"), duration=duration,
                                  stream=src["stream"])
         rec["caption_source"] = src["label"]
+        rec["_words"] = words            # reused by audio_profanity() (popped by render.py, never stored)
         if words:
             words = edit_gates.mask_words(words, pol)
             ass_name = path.stem + ".words.ass"
@@ -298,7 +301,7 @@ def apply(path, choice, joins=(), model=None, energy_source=None, caption_source
             flags = edit_gates.caption_flags(words, pol)
             rec.update({"words_json": words_name, "words_json_sha256": edit_gates.sha256_bytes(path.parent / words_name),
                         "caption_review": {**flags, "warnings": edit_gates.flag_reasons(flags)},
-                        "audio_bleep": "NOT applied: captions are masked, the spoken audio is unchanged (human review)"})
+                        "audio_bleep": "see profanity_audio (phase 2.8: bleep is a per-clip human choice)"})
         rec.update({"word_captions": ("BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK" if words else
                                       ("SKIPPED_NO_FASTER_WHISPER" if words is None else "SKIPPED_NO_SPEECH")),
                     "word_caption_style": word_style if words else None, "word_count": len(words or []),
@@ -330,4 +333,63 @@ def apply(path, choice, joins=(), model=None, energy_source=None, caption_source
                     "end_fade": f"{FADE_SECONDS}s" if "end_fade" in effects else None,
                     "progress_bar": "progress_bar" in effects,
                     "flash_cuts": [round(j, 3) for j in flashes], "flash_intensity": intensity if flashes else None})
+    return rec
+
+
+# ---------- phase 2.8: audio profanity scan + optional bleep ----------
+def bleep_filter(segments_ms, mode, duration):
+    """[0:a] -> [a]: mute (volume 0) or 1 kHz tone over the segments; outside them the audio is untouched."""
+    if mode not in ("tone", "mute") or not segments_ms:
+        raise ValueError("bleep_filter needs mode tone|mute and at least one segment")
+    on = "+".join(f"between(t,{a / 1000:.3f},{b / 1000:.3f})" for a, b in segments_ms)
+    muted = f"[0:a]volume=0:enable='{on}'"
+    if mode == "mute":
+        return muted + "[a]"
+    tone = (f"aevalsrc='0.25*sin(2*PI*{edit_gates.BLEEP_TONE_HZ}*t)*gt({on},0)':s=48000:d={float(duration):.3f}")
+    return f"{muted}[m];{tone}[t];[m][t]amix=inputs=2:duration=first:normalize=0[a]"
+
+
+def apply_bleep(path, segments_ms, mode):
+    """Re-encode only the audio of `path` in place (video stream copied)."""
+    path = pathlib.Path(path)
+    graph = bleep_filter(segments_ms, mode, duration_of(path))
+    tmp = path.with_name(path.stem + ".bleep.tmp.mp4")
+    try:
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", path.name, "-filter_complex", graph,
+                        "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+                        "-movflags", "+faststart", tmp.name], check=True, cwd=str(path.parent))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+_NOT_TRANSCRIBED = object()
+
+
+def has_audio_stream(path):
+    p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0",
+                        str(path)], capture_output=True, text=True)
+    return bool(p.stdout.strip())
+
+
+def audio_profanity(path, choice, caption_source, words=_NOT_TRANSCRIBED, model=None, pol=None):
+    """Scan the creator MIC STEM transcript for strong profanity (edit_gates.profanity_terms) and bleep it in the
+    final audio when the human edit choice says bleep=tone|mute. Returns the int-only profanity_audio record."""
+    pol = pol or edit_gates.policy()
+    mode = (choice or {}).get("bleep") or "off"
+    if not caption_source:
+        raise edit_gates.CaptionSourceError("audio profanity scan needs a separate creator mic stem")
+    if words is _NOT_TRANSCRIBED:
+        words = transcribe_words(caption_source["media"], model, start=caption_source.get("start"),
+                                 duration=duration_of(path), stream=caption_source["stream"])
+    if words is None:
+        return edit_gates.audio_profanity_record([], mode, caption_source["label"], "UNAVAILABLE_NO_FASTER_WHISPER", pol,
+                                                 mix_status="UNAVAILABLE_NO_FASTER_WHISPER")
+    # phase 2.8.1: also transcribe the FULL final mix (game dialogue + voiceover + mic) before any bleep
+    mix_words = transcribe_words(path, model, stream="0:a:0") if has_audio_stream(path) else []
+    mix_status = "UNAVAILABLE_NO_FASTER_WHISPER" if mix_words is None else edit_gates.AUDIO_SCANNED
+    rec = edit_gates.audio_profanity_record(words, mode, caption_source["label"], edit_gates.AUDIO_SCANNED, pol,
+                                            mix_words=mix_words or [], mix_status=mix_status)
+    if rec["bleeped_segments"]:
+        apply_bleep(path, rec["bleeped_segments"], mode)
     return rec

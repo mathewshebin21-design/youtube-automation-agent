@@ -85,12 +85,13 @@ def verify_package(pkg_dir):
         if pkg["upload"].get("paidProductPlacement") is not (paid == "present") or paid not in compliance.PAID_VALUES:
             problems.append("paidProductPlacement in package does not match the signed paid_promotion")
         if compliance.is_mixed_track(clip):
-            so = [e for e in entries if e.get("action") == "signoff" and e.get("check") == "mixed_track_commentary_confirmed"
-                  and e.get("clip") == pkg["clip"] and e.get("file_sha256") == pkg["file_sha256"]]
-            if so and len((so[-1].get("note") or "").split()) < 5:
-                problems.append("mixed_track_commentary_confirmed: signed note must have 5+ words")
-            if (clip.get("commentary") or {}).get("commentary_source") != "mixed_track_signed":
-                problems.append("commentary_source must be mixed_track_signed for a clip without a mic stem")
+            problems.append("no separate creator mic stem: the mixed-track bypass was removed in phase 2.8 (60% mic measurement required)")
+        live = compliance.live_voice_coverage(clip)     # phase 2.8.1: independent live-voice floor (mic stem only)
+        if live < compliance.MIN_LIVE_VOICE:
+            problems.append(f"creator live voice (mic stem only) covers {live:.0%}; at least 30% required (TTS cannot replace it)")
+        mn = compliance.music_note_problem(clip, entries, pkg["file_sha256"])   # phase 2.8.1: independent music note
+        if mn:
+            problems.append(mn)
         scan = clip.get("overlay_scan") or {}
         if scan.get("file_sha256") != pkg["file_sha256"]:
             problems.append("overlay scan was not run on this exact file")

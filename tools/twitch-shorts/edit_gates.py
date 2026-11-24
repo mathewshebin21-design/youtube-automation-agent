@@ -1,13 +1,20 @@
-"""Phase 2.7 compliance rules for the edit stage, shared by edit.py, render.py, review.py and upload_private.py.
+"""Phase 2.7/2.8 compliance rules for the edit stage, shared by edit.py, render.py, review.py and upload_private.py.
 The Node side (utils/cutscenecity/external-shorts.js) re-implements the same checks independently.
 
 - Captions come ONLY from a separate creator mic stem (OBS multitrack stream or mic file). Mixed/game tracks are refused.
 - Strong profanity in captions is masked (f******) from caption_policy.profanity_terms; any in the first 10 s is flagged.
-  LIMITATION: the audio itself is NOT bleeped.
+  The caption mask does not touch the audio; the audio bleep is the separate per-clip choice below (phase 2.8).
 - Caption text is scanned for story names and plot keywords (caption_policy + the shared spoiler lists); hits are flagged.
 - captions_reviewed (human) approves the exact words.json (SHA-256 bound) for the exact final file.
 - Edit style + effects are a per-clip human choice (signed edit_choice entry); renders refuse edits without one.
 - Flash cut: off by default, at most 1 per clip, intensity <= 0.5.
+- Phase 2.8 audio profanity: the mic stem transcript (word timestamps) is scanned for the same profanity_terms; the
+  per-clip edit choice can bleep them (bleep=tone: 1 kHz tone, bleep=mute: silence) over the word timestamps.
+  Strong profanity in the first 10 s blocks unless bleeped; profanity_audio_reviewed (human) is pinned to the final
+  file SHA-256 and the profanity_audio record hash. Title and thumbnail text are checked against the same list.
+- Phase 2.8.1: the FULL final mix (game dialogue, voiceover, mic) is transcribed and scanned too (mix_hits); bleep
+  segments cover mic + mix hits. Because whisper misses words under music/game noise, the profanity_audio_reviewed
+  sign-off must also record first_10s_full_mix_checked=true (a human listened to the first 10 s of the full mix).
 """
 import hashlib
 import json
@@ -25,6 +32,10 @@ FLASH_DEFAULT_INTENSITY = 0.5
 WARN_FIRST_SECONDS = 10
 PLACEHOLDER = "placeholder"
 WORDS_PACKAGE_NAME = "captions.words.json"
+BLEEP_MODES = ("off", "tone", "mute")
+BLEEP_PAD_MS = 50                  # each bleep covers the word +/- 50 ms
+BLEEP_TONE_HZ = 1000
+AUDIO_SCANNED = "SCANNED"
 MIC_REQUIRED = ("captions are generated only from a separate creator mic stem (OBS multitrack --mic-stream N or a "
                 "--mic file); this clip has only the mixed Twitch/game track, so captions are refused")
 
@@ -147,12 +158,114 @@ def flag_reasons(flags):
     if flags.get("keyword_list_incomplete"):
         out.append("caption keyword list still has PLACEHOLDER entries (Shebin/Compliance must fill it in)")
     if flags.get("profanity_masked"):
-        out.append(f"{flags['profanity_masked']} masked word(s): audio is NOT bleeped")
+        out.append(f"{flags['profanity_masked']} masked word(s): the caption mask alone leaves audio NOT bleeped (see profanity_audio / --bleep)")
     return out
+
+
+def sha256_record(obj):
+    """Same canonical hash as gatelog.sha256_json / Node sha256Json (sorted keys, compact, ints only)."""
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def sha256_bytes(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+# ---------- phase 2.8: audio profanity (mic stem transcript) + clean title/thumbnail ----------
+def _ms(sec):
+    return int(round(float(sec) * 1000))
+
+
+def bleep_segments(hits):
+    """[[start_ms, end_ms]] covering each hit +/- BLEEP_PAD_MS (merged when they overlap). Ints only (signed/hashed)."""
+    segs = []
+    for h in sorted(hits, key=lambda h: h["start_ms"]):
+        a, b = max(0, h["start_ms"] - BLEEP_PAD_MS), h["end_ms"] + BLEEP_PAD_MS
+        if segs and a <= segs[-1][1]:
+            segs[-1][1] = max(segs[-1][1], b)
+        else:
+            segs.append([a, b])
+    return segs
+
+
+def _profane_hits(words, terms):
+    out = []
+    for w in (words or []):
+        if w.get("masked") or is_profane(w["word"], terms):
+            out.append({"word": w["word"] if w.get("masked") else mask_word(w["word"]),
+                        "start_ms": _ms(w["start"]), "end_ms": _ms(w.get("end", w["start"]))})
+    return out
+
+
+MIX_NOT_SCANNED = "NOT_SCANNED"
+
+
+def all_hits(rec):
+    return list((rec or {}).get("hits") or []) + list((rec or {}).get("mix_hits") or [])
+
+
+def audio_profanity_record(words, bleep="off", source="", status=AUDIO_SCANNED, pol=None, mix_words=None, mix_status=None):
+    """Int-only record of strong profanity in the mic stem transcript (`hits`) and, since phase 2.8.1, in the
+    FULL final mix transcript (`mix_hits`: game dialogue, voiceover, mic). Words may be raw or already masked
+    (masked=True); the raw word is never stored. Bleep segments cover both lists when bleep != off."""
+    terms = profanity_terms(pol)
+    hits = _profane_hits(words, terms)
+    if mix_status is None:
+        mix_status = AUDIO_SCANNED if mix_words is not None else MIX_NOT_SCANNED
+    mix_hits = _profane_hits(mix_words, terms) if mix_status == AUDIO_SCANNED else []
+    if bleep not in BLEEP_MODES:
+        raise ValueError("bleep must be off, tone or mute")
+    rec = {"status": status, "source": source, "terms": len(terms), "hits": hits,
+           "mix_status": mix_status, "mix_hits": mix_hits, "bleep": bleep,
+           "bleeped_segments": bleep_segments(hits + mix_hits) if (bleep != "off" and status == AUDIO_SCANNED) else []}
+    return {**rec, **audio_profanity_state(rec, pol)}
+
+
+def audio_profanity_state(rec, pol=None):
+    """Recomputed from hits + bleeped_segments (never trusts stored flags): which hits stay audible."""
+    first_ms = int(caption_policy(pol).get("profanity_warn_first_seconds", WARN_FIRST_SECONDS)) * 1000
+    segs = (rec or {}).get("bleeped_segments") or []
+    covered = lambda h: any(a <= h["start_ms"] and h["end_ms"] <= b for a, b in segs)  # noqa: E731
+    hits = all_hits(rec)
+    unbleeped = sorted({h["start_ms"] for h in hits if not covered(h)})
+    return {"hit_count": len(hits), "mix_hit_count": len((rec or {}).get("mix_hits") or []),
+            "first_10s_ms": sorted({h["start_ms"] for h in hits if h["start_ms"] < first_ms}),
+            "unbleeped_ms": unbleeped, "unbleeped_first_10s_ms": [t for t in unbleeped if t < first_ms]}
+
+
+def audio_profanity_problems(rec, choice=None, pol=None):
+    """Blocking problems for the audio profanity record (manifest consistency; Node re-checks the same)."""
+    if not rec:
+        return ["profanity_audio: the mic stem was not scanned for profanity (record an edit choice: review.py edit "
+                "--by NAME [--bleep tone|mute], any style incl. off, on a mic-stem render)"]
+    out = []
+    if rec.get("status") != AUDIO_SCANNED:
+        out.append(f"profanity_audio: scan {rec.get('status')} (faster-whisper needed on the mic stem); failing closed")
+    if rec.get("mix_status") != AUDIO_SCANNED:
+        out.append(f"profanity_audio: full-mix scan {rec.get('mix_status') or MIX_NOT_SCANNED} (game dialogue/voiceover "
+                   "not covered; re-run review.py edit); failing closed")
+    st = audio_profanity_state(rec, pol)
+    if st["unbleeped_first_10s_ms"]:
+        out.append(f"strong profanity in the first 10 s is not bleeped (at {st['unbleeped_first_10s_ms']} ms): "
+                   "review.py edit --bleep tone|mute")
+    if choice and (choice.get("bleep") or "off") != (rec.get("bleep") or "off"):
+        out.append("profanity_audio: bleep differs from the recorded human edit choice")
+    if (rec.get("bleep") or "off") != "off" and rec.get("status") == AUDIO_SCANNED and all_hits(rec) and \
+            rec.get("bleeped_segments") != bleep_segments(all_hits(rec)):
+        out.append("profanity_audio: bleeped segments do not cover the profanity hits")
+    return out
+
+
+def text_profanity(fields, pol=None):
+    """{field: [masked hits]} for strong profanity in short text fields (title, thumbnail text)."""
+    terms = profanity_terms(pol)
+    out = {}
+    for name, text in fields.items():
+        toks = re.split(r"[\s/_\-]+", str(text or ""))
+        hits = [mask_word(t) for t in toks if is_profane(t, terms)]
+        if hits:
+            out[name] = hits
+    return out
 
 
 # ---------- per-clip human edit choice ----------
@@ -188,8 +301,11 @@ def validate_choice(choice):
             raise ValueError(f"flash intensity must be > 0 and <= {FLASH_MAX_INTENSITY}")
     else:
         pct = 0
+    bleep = str(choice.get("bleep") or "off").strip().lower()
+    if bleep not in BLEEP_MODES:
+        raise ValueError("bleep must be off, tone (1 kHz) or mute")
     return {"edit_style": style, "effects": sorted(set(effects), key=EFFECTS.index), "by": str(choice["by"]).strip(),
-            "flash_intensity_pct": pct, "caption_style": choice.get("caption_style") or ""}
+            "flash_intensity_pct": pct, "caption_style": choice.get("caption_style") or "", "bleep": bleep}
 
 
 def flash_plan(joins, enabled, intensity=FLASH_DEFAULT_INTENSITY):
@@ -239,14 +355,26 @@ def latest(entries, action, clip_file, **match):
 def signed_problems(clip, entries, file_sha, words_path):
     out = list(render_edit_problems(clip))
     r = clip.get("render") or {}
-    if (r.get("edit_style") or "off") != "off":
+    pa = r.get("profanity_audio")
+    if (r.get("edit_style") or "off") != "off" or ((pa or {}).get("bleep") or "off") != "off":
         e = latest(entries, "edit_choice", clip["file"])
         ec = clip.get("edit_choice") or {}
         if not e:
             out.append("edit_choice: no signed per-clip human edit choice")
-        elif (e.get("edit_style"), e.get("effects"), e.get("flash_intensity_pct"), e.get("by")) != \
-                (ec.get("edit_style"), ec.get("effects"), ec.get("flash_intensity_pct"), ec.get("by")):
+        elif (e.get("edit_style"), e.get("effects"), e.get("flash_intensity_pct"), e.get("by"), e.get("bleep") or "off") != \
+                (ec.get("edit_style"), ec.get("effects"), ec.get("flash_intensity_pct"), ec.get("by"), ec.get("bleep") or "off"):
             out.append("edit_choice: manifest choice differs from the signed choice")
+    # phase 2.8: audio profanity scan + profanity_audio_reviewed pinned to the final file and the record hash
+    out += audio_profanity_problems(pa, clip.get("edit_choice"))
+    if pa:
+        so = latest(entries, "signoff", clip["file"], check="profanity_audio_reviewed", file_sha256=file_sha)
+        if not so or so.get("final_sha256") != file_sha or so.get("profanity_audio_sha256") != sha256_record(pa):
+            out.append("profanity_audio_reviewed: no signed review pinned to this exact final file + audio scan")
+        elif so.get("first_10s_full_mix_checked") is not True:
+            out.append("profanity_audio_reviewed: the sign-off must confirm the first 10 s of the FULL mix were listened "
+                       "to (--first-10s-full-mix-checked)")
+        elif all_hits(pa) and len(str(so.get("note") or "").split()) < 5:
+            out.append("profanity_audio_reviewed: profanity found, the sign-off needs a 5+ word note")
     if captions_burned(r):
         p = pathlib.Path(words_path) if words_path else None
         if not p or not p.exists():
