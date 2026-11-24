@@ -104,7 +104,7 @@ def _final_states(entries):
     return state.values()
 
 
-HARD_DAILY_CAP = 2  # raised from 1 to 2 in Phase 2.5 (Shebin's approval); day boundary = IST (UTC+05:30)
+HARD_DAILY_CAP = 1  # phase 2.7 (Compliance): back from 2 to 1; day boundary = IST (UTC+05:30)
 
 
 def effective_daily_cap(env_value=None, policy_value=None):

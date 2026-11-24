@@ -205,13 +205,38 @@ def music_hint(clip, ctx):
 def overlay_hint(clip, ctx):
     s = clip.get("overlay_scan")
     if not s:
-        return FAIL, "run the overlay scan on the final render (review.py precheck) before signing off"
+        return FAIL, "run the overlay scan (review.py precheck; it scans the pre-edit render) before signing off"
     if s.get("flagged") is None:
         return WARN, "overlay scan unavailable (" + str(s.get("error", "no detector")) + "): check every frame, note required"
     if s["flagged"]:
         return WARN, (f"possible text/overlay in {len(s.get('regions') or [])} region(s) via {'+'.join(s.get('methods', []))}: "
                       "confirm each is blurred or is your own HUD, note required")
     return PASS, "no persistent overlay text detected (heuristic; human check still required)"
+
+
+# ---------- captions (phase 2.7): mic stem only, masked profanity, keyword scan, human review of words.json ----------
+def _captions_burned(clip):
+    return str((clip.get("render") or {}).get("captions") or "OFF").startswith("BURNED")
+
+
+@register_check("captions_reviewed", "human",
+                "A person read the burned captions (the exact words.json, SHA-256 bound) against the final file: words "
+                "are right, strong profanity is masked (audio is NOT bleeped), no story names or plot dialogue.",
+                applies=_captions_burned)
+def captions_hint(clip, ctx):
+    import edit_gates
+    r = clip.get("render") or {}
+    if not str(r.get("caption_source") or "").startswith("mic_"):
+        return FAIL, "captions not generated from a separate mic stem (mixed/game track captions are refused): re-render"
+    if not r.get("words_json_sha256"):
+        return FAIL, "no words.json hash recorded for the burned captions: re-render"
+    flags = r.get("caption_review") or {}
+    if flags.get("unmasked_profanity"):
+        return FAIL, "unmasked strong profanity in captions: re-render"
+    reasons = edit_gates.flag_reasons(flags)
+    if reasons:
+        return WARN, "; ".join(reasons) + " (note required)"
+    return PASS, "no caption flags (human review still required)"
 
 
 # ---------- paid promotion (videos.insert paidProductPlacementDetails) ----------
@@ -272,6 +297,19 @@ def mixed_track_signed(clip):
             and not clip["compliance"]["mixed_track_commentary_confirmed"].get("not_applicable"))
 
 
+MIXED_ENV = "CUTSCENECITY_ALLOW_MIXED_TRACK"
+MIXED_OFF = ("separate mic track required: the mixed-track path is OFF by default (phase 2.7); record an OBS multitrack "
+             "and run review.py commentary --mic-stream N, or opt in with CUTSCENECITY_ALLOW_MIXED_TRACK=true")
+
+
+def mixed_track_allowed(ctx=None, env=None):
+    """Phase 2.7: the mixed-track path is opt-in (env CUTSCENECITY_ALLOW_MIXED_TRACK=true or policy mixed_track_path_enabled)."""
+    env = os.environ if env is None else env
+    if str(env.get(MIXED_ENV, "")).strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return bool(((ctx or {}).get("policy") or {}).get("mixed_track_path_enabled", False))
+
+
 def owner_ok(clip):
     return creator_owned_source(clip, {"policy": None})[0] == PASS
 
@@ -281,6 +319,8 @@ def owner_ok(clip):
                 "confirms the creator's live commentary is clearly audible over the game audio. Note of 5+ words required.",
                 applies=is_mixed_track)
 def mixed_track_hint(clip, ctx):
+    if not mixed_track_allowed(ctx):
+        return FAIL, MIXED_OFF
     if not owner_ok(clip):
         return FAIL, "mixed-track path is only for creator-owned VODs (creator_owned_source must pass)"
     share = (clip.get("commentary") or {}).get("mixed_track_speech_share")
@@ -303,6 +343,8 @@ def commentary_gate(clip, ctx):
     if not c.get("mic_source"):
         if not owner_ok(clip):
             return FAIL, "no creator mic stem and the VOD is not creator-owned"
+        if not mixed_track_allowed(ctx):
+            return FAIL, MIXED_OFF
         if mixed_track_signed(clip):
             return PASS, "mixed_track_signed: reviewer confirmed live commentary is audible (no mic stem to measure)"
         share = c.get("mixed_track_speech_share")
@@ -326,6 +368,8 @@ def commentary_gate(clip, ctx):
 def live_reaction_gate(clip, ctx):
     r = clip.get("render") or {}
     if is_mixed_track(clip) and r.get("audio_mode", "source") == "source" and owner_ok(clip):
+        if not mixed_track_allowed(ctx):
+            return FAIL, MIXED_OFF
         if r.get("music_volume", 1.0) != 1.0:
             return FAIL, "mixed track was lowered (music volume < 1.0 also lowers the creator voice in a mixed track)"
         if mixed_track_signed(clip):
@@ -336,6 +380,8 @@ def live_reaction_gate(clip, ctx):
                       "cannot be separated: record an OBS multitrack (mic on its own track) and pass --mic-stream/--mic")
     if r.get("mic_gain") != 1.0:
         return FAIL, "creator mic was lowered"
+    if r.get("audio_mode") == "mix" and r.get("keep_game_audio_opt_in") is not True:
+        return FAIL, "game audio kept without the --keep-game-audio opt-in (game audio is stripped by default)"
     return PASS, f"creator mic {r['mic_source']} kept at full level"
 
 
@@ -370,7 +416,8 @@ def script_originality_gate(clip, ctx):
 
 
 @register_check("style_rotation", "auto",
-                "Voice preset (when TTS) and caption style come from the policy lists and differ from the previous upload.")
+                "Voice preset (when TTS) and caption style come from the policy lists and differ from the previous upload; "
+                "edit style + effects match the per-clip human edit choice; flash cut <= 1 per clip at <= 0.5 intensity.")
 def rotation_gate(clip, ctx):
     pol = ctx.get("policy") or {}
     voices = [v["name"] for v in pol.get("voice_presets", [])]
@@ -390,6 +437,8 @@ def rotation_gate(clip, ctx):
             out.append(f"caption style {cs!r} not in policy caption_styles")
         elif prev.get("caption_style") == cs:
             out.append(f"caption style {cs} repeats the previous upload")
+    import edit_gates
+    out += edit_gates.render_edit_problems(clip)
     return (FAIL, "; ".join(out)) if out else (PASS, "rotation ok")
 
 

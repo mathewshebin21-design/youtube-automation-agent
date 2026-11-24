@@ -1,4 +1,8 @@
-"""Overlay / third-party text flagging on the FINAL render (gate: overlays_third_parties_cleared).
+"""Overlay / third-party text flagging (gate: overlays_third_parties_cleared).
+
+Phase 2.7: review.py precheck scans the PRE-EDIT render (<stem>.preedit.mp4, before our captions/effects are
+burned in) so our own captions do not raise false flags. If no pre-edit render exists but captions are burned,
+the caption band (and progress bar) is masked with a flat fill before detection (mask_bands).
 
 This only FLAGS. It never clears a clip: overlays_third_parties_cleared is a human check that is always
 required. When this scan flags something, or cannot run, the sign-off needs a written note.
@@ -83,13 +87,25 @@ def ocr_words(frame, run=subprocess.run):
     return boxes
 
 
-def scan(video, file_sha256, samples=8, which=shutil.which, run=subprocess.run):
+def mask(frames, bands):
+    """Flat-fill horizontal bands [(y0, y1) fractions of the height]: no edges, no OCR text inside them."""
+    for f in frames:
+        h = f.shape[0]
+        for y0, y1 in bands:
+            f[int(h * y0):int(round(h * y1)), :] = 128
+    return frames
+
+
+def scan(video, file_sha256, samples=8, which=shutil.which, run=subprocess.run, mask_bands=None):
     result = {"file_sha256": file_sha256, "methods": [], "flagged": None, "regions": [], "frames": 0,
               "note": "flagging only; a human must still sign overlays_third_parties_cleared"}
     frames = _frames(video, samples)
     if not frames:
         result["error"] = "OpenCV not installed or no frames read: scan unavailable"
         return result
+    if mask_bands:
+        mask(frames, mask_bands)
+        result["masked_bands"] = [list(b) for b in mask_bands]
     result["frames"] = len(frames)
     flagged = False
     cells = edge_cells(frames)

@@ -3,7 +3,8 @@
   python review.py status    --output output [--clip short_01.mp4]
   python review.py set       --output output --clip short_01.mp4 --file clip-details.json
   python review.py precheck  --output output --clip short_01.mp4
-  python review.py commentary --output output --clip short_01.mp4 --mic mic.wav|--mic-stream 1 [--audio voiceover.wav [--tts --voice-preset NAME]] [--captions --caption-style NAME]
+  python review.py commentary --output output --clip short_01.mp4 --mic mic.wav|--mic-stream 1 [--audio voiceover.wav [--tts --voice-preset NAME]]
+  python review.py edit      --output output --clip short_01.mp4 --style off|clean|hype --effects captions,punch_in,... --by "Shebin" [--caption-style NAME] [--flash-intensity 0.5] [--no-render]
   python review.py script    --output output --clip short_01.mp4 --file script.txt --by "Shebin" [--note "..."]
   python review.py signoff   --output output --clip short_01.mp4 --check no_story_cutscene --by "Shebin" --note "..."
   python review.py approve   --output output --clip short_01.mp4 --by "Shebin"
@@ -17,6 +18,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import compliance  # noqa: E402
+import edit_gates  # noqa: E402
 import gatelog  # noqa: E402
 import qa  # noqa: E402
 
@@ -64,6 +66,8 @@ FIX_COMMANDS = {
     "live_reaction_preserved": "same as original_commentary",
     "mixed_track_commentary_confirmed": "review.py precheck --clip {c}; listen; review.py signoff --clip {c} --check mixed_track_commentary_confirmed --by NAME --note \"<5+ words>\"",
     "commentary_script": "review.py script --clip {c} --file script.txt --by NAME",
+    "captions_reviewed": "read {c} words.json against the video, then: review.py signoff --clip {c} --check captions_reviewed --by NAME --note \"<5+ words if flagged>\"",
+    "style_rotation": "edits need a per-clip choice: review.py edit --clip {c} --style clean|hype --effects ... --by NAME",
 }
 
 
@@ -112,10 +116,30 @@ def cmd_precheck(a, root, m, c_ctx):
     c["fingerprint_precheck"] = compliance.fingerprint(root / c["file"])
     if compliance.is_mixed_track(c):
         c.setdefault("commentary", {})["mixed_track_speech_share"] = compliance.mixed_speech_share(root / c["file"])
-    import overlay_scan
-    c["overlay_scan"] = overlay_scan.scan(root / c["file"], gatelog.sha256_file(root / c["file"]))
+    c["overlay_scan"] = overlay_precheck(root, c)
     compliance.evaluate(c, c_ctx)
     print(json.dumps({k: c[k] for k in ("cutscene_scan", "fingerprint_precheck", "overlay_scan")}, indent=2))
+
+
+def overlay_precheck(root, c):
+    """Phase 2.7: scan the PRE-EDIT render (before our captions/effects) so our own captions never raise flags.
+    Fallback: final render with the caption band + progress bar masked. The result is bound to the FINAL file hash."""
+    import edit as edit_stage
+    import overlay_scan
+    r = c.get("render") or {}
+    final = root / c["file"]
+    final_sha = gatelog.sha256_file(final)
+    pre = root / r["pre_edit_file"] if r.get("pre_edit_file") else None
+    if pre is not None and pre.exists() and edit_gates.sha256_bytes(pre) == r.get("pre_edit_sha256"):
+        res = overlay_scan.scan(pre, final_sha)
+        res.update({"scanned": "pre_edit", "scanned_file": pre.name, "scanned_sha256": r["pre_edit_sha256"]})
+    elif edit_gates.captions_burned(r) or (r.get("edit_style") or "off") != "off":
+        res = overlay_scan.scan(final, final_sha, mask_bands=[edit_stage.CAPTION_BAND, edit_stage.PROGRESS_BAND])
+        res["scanned"] = "final_caption_band_masked"
+    else:
+        res = overlay_scan.scan(final, final_sha)
+        res["scanned"] = "final_no_edit"
+    return res
 
 
 PAID_STATEMENTS = {
@@ -180,20 +204,18 @@ def cmd_commentary(a, root, m, c_ctx):
     live, combined = compliance.speech_seconds(live_wav), compliance.speech_seconds(comb_wav)
     for w in {live_wav, comb_wav}:
         w.unlink(missing_ok=True)
-    pol = c_ctx.get("policy") or {}
-    styles = pol.get("caption_styles") or {}
-    if a.captions and a.caption_style not in styles:
-        raise SystemExit(f"--caption-style must be one of {sorted(styles)}")
+    if a.captions or a.edit_style not in (None, "off", "none"):
+        raise SystemExit("phase 2.7: captions/edit style are a per-clip human choice: after this re-render run "
+                         "review.py edit --clip ... --style ... --effects ... --by NAME (captions need this mic stem)")
     prev = c.get("render") or {}
     c["render"] = render.render(src, c["start"], c["end"], root, c["file"], captions=a.captions,
                                 layout=prev.get("layout", "blur"), crop_x=prev.get("crop_x", 0.5),
-                                facecam=prev.get("facecam"), audio_mode="mic_stem" if a.strip_game_audio else "mix",
+                                facecam=prev.get("facecam"), audio_mode="mix" if a.keep_game_audio else "mic_stem",
+                                keep_game_audio=bool(a.keep_game_audio),
                                 game_volume=render.music_volume(a.music_volume), commentary=str(voice) if voice else None,
                                 mic=a.mic, mic_stream=a.mic_stream, blur_regions=prev.get("blur_regions") or [],
-                                caption_style=styles.get(a.caption_style) if a.captions else None,
-                                caption_style_name=a.caption_style if a.captions else None, upscale=a.upscale,
-                                edit_style=a.edit_style,
-                                word_caption_style=a.caption_style if a.caption_style in render.edit_stage.WORD_STYLES else None)
+                                upscale=a.upscale, joins=c.get("joins") or [],
+                                edit_choice=recorded_choice(c))   # the signed per-clip edit choice, if any
     c["render"]["facecam"] = prev.get("facecam")
     c["render"]["profile"] = prev.get("profile")
     c["commentary"] = {"path": str(voice) if voice else None, "mic_source": c["render"]["mic_source"],
@@ -208,6 +230,80 @@ def cmd_commentary(a, root, m, c_ctx):
     reset_human_signoffs(c, "file re-rendered with commentary")
     compliance.evaluate(c, c_ctx)
     print(json.dumps({"commentary": c["commentary"], "gate": c["compliance"]["original_commentary"]}, indent=2))
+
+
+def recorded_choice(c):
+    ec = c.get("edit_choice")
+    return {k: ec[k] for k in ("edit_style", "effects", "by", "flash_intensity_pct", "caption_style")} if ec else None
+
+
+def cmd_edit(a, root, m, c_ctx):
+    """Record the per-clip human edit choice (signed), then re-render with it using the clip's previous audio setup."""
+    import render
+    c = find(m, a.clip)
+    if not (a.by or "").strip():
+        raise SystemExit("--by is required: the edit style and effects are a human choice")
+    try:
+        a.style = a.style or edit_gates.DEFAULT_CHOICE_STYLE
+        effects = edit_gates.parse_effects(a.effects if a.effects is not None or a.style != "clean" else "captions")
+        pct = None if a.flash_intensity is None else int(round(a.flash_intensity * 100))
+        if a.flash_intensity is not None and a.flash_intensity > edit_gates.FLASH_MAX_INTENSITY:
+            raise ValueError(f"flash intensity must be <= {edit_gates.FLASH_MAX_INTENSITY}")
+        choice = edit_gates.validate_choice({"edit_style": a.style, "effects": effects, "by": a.by,
+                                             "flash_intensity_pct": pct, "caption_style": a.caption_style or ""})
+    except ValueError as e:
+        raise SystemExit(f"edit choice refused: {e}")
+    if choice["caption_style"] and choice["caption_style"] not in render.edit_stage.WORD_STYLES:
+        raise SystemExit(f"--caption-style must be one of {sorted(render.edit_stage.WORD_STYLES)}")
+    prev = c.get("render") or {}
+    if "captions" in choice["effects"] and prev.get("audio_mode") not in ("mix", "mic_stem"):
+        raise SystemExit("edit choice refused: " + edit_gates.MIC_REQUIRED +
+                         " (run review.py commentary --mic FILE | --mic-stream N first)")
+    e = gatelog.append_review(root / "review_log.jsonl", action="edit_choice", by=choice["by"], clip=c["file"],
+                              edit_style=choice["edit_style"], effects=choice["effects"],
+                              flash_intensity_pct=choice["flash_intensity_pct"], caption_style=choice["caption_style"],
+                              note=a.note or "")
+    c["edit_choice"] = {**choice, "at": e["at"], "log_seq": e["seq"]}
+    if a.no_render:
+        compliance.evaluate(c, c_ctx)
+        print(json.dumps({"edit_choice": c["edit_choice"], "rendered": False}, indent=2))
+        return
+    src = source_video(root)
+    if not src:
+        raise SystemExit("source VOD not in output dir; cannot re-render with the edit")
+    opts = {"layout": prev.get("layout", "blur"), "crop_x": prev.get("crop_x", 0.5), "facecam": prev.get("facecam"),
+            "blur_regions": prev.get("blur_regions") or [], "audio_mode": prev.get("audio_mode") or "source",
+            "joins": c.get("joins") or [], "edit_choice": recorded_choice(c)}
+    up = str(prev.get("upscale") or "")
+    opts["upscale"] = up if up in ("1440", "2160", "off") else None
+    if opts["audio_mode"] in ("mix", "mic_stem"):
+        ms = str(prev.get("mic_source") or "")
+        if ms.startswith("stream:"):
+            opts["mic_stream"] = int(ms.split(":", 1)[1])
+        elif prev.get("mic_path"):
+            opts["mic"] = prev["mic_path"]
+        else:
+            raise SystemExit("previous render has no reusable mic stem: run review.py commentary --mic FILE again")
+        if (c.get("commentary") or {}).get("path"):
+            opts["commentary"] = c["commentary"]["path"]
+    if opts["audio_mode"] != "mic_stem":
+        opts["game_volume"] = float(prev.get("music_volume") or 1.0)
+    if opts["audio_mode"] == "mix":
+        opts["keep_game_audio"] = bool(prev.get("keep_game_audio_opt_in"))
+    try:
+        c["render"] = render.render(src, c["start"], c["end"], root, c["file"], **opts)
+    except ValueError as err:
+        raise SystemExit(f"edit refused: {err}")
+    for k in ("facecam", "profile"):
+        c["render"][k] = prev.get(k)
+    c["technical_qa"] = qa.validate(root / c["file"], c["start"], c["end"])
+    if compliance.is_mixed_track(c):
+        c.setdefault("commentary", {})["mixed_track_speech_share"] = compliance.mixed_speech_share(root / c["file"])
+    reset_human_signoffs(c, "file re-rendered with a new edit choice")
+    compliance.evaluate(c, c_ctx)
+    print(json.dumps({"edit_choice": c["edit_choice"], "render": {k: c["render"].get(k) for k in (
+        "edit_style", "edit_effects", "captions", "caption_source", "words_json", "caption_review", "zoom_count",
+        "flash_cuts", "pre_edit_file")}}, indent=2))
 
 
 def cmd_script(a, root, m, c_ctx):
@@ -240,7 +336,7 @@ def reset_human_signoffs(c, why):
     c.pop("paid_promotion", None)    # declaration is bound to the old file hash
 
 
-def unsigned_human_checks(c, entries, file_sha):
+def unsigned_human_checks(c, entries, file_sha, root=None):
     """Human PASS entries in the manifest must be backed by a signed sign-off for the current file."""
     signed = {e["check"] for e in entries if e.get("action") == "signoff" and e.get("clip") == c["file"]
               and e.get("file_sha256") == file_sha}
@@ -257,6 +353,8 @@ def unsigned_human_checks(c, entries, file_sha):
                  and e.get("script_sha256") == compliance._sha(script) for e in entries)
         if not ok:
             out.append("commentary_script (no signed script approval)")
+    r = c.get("render") or {}
+    out += edit_gates.signed_problems(c, entries, file_sha, root / r["words_json"] if (root and r.get("words_json")) else None)
     return out
 
 
@@ -266,19 +364,32 @@ def cmd_signoff(a, root, m, c_ctx):
         raise SystemExit("overlay scan is missing or for an older render: run review.py precheck first")
     if a.check == "mixed_track_commentary_confirmed" and len((a.note or "").split()) < 5:
         raise SystemExit("mixed_track_commentary_confirmed needs --note with 5+ words saying the live commentary is audible")
+    extra = {}
+    if a.check == "captions_reviewed":
+        r = c.get("render") or {}
+        wp = root / r["words_json"] if r.get("words_json") else None
+        if not wp or not wp.exists() or edit_gates.sha256_bytes(wp) != r.get("words_json_sha256"):
+            raise SystemExit("captions_reviewed: words.json is missing or changed since the render; re-render")
+        flags = edit_gates.caption_flags(json.loads(wp.read_text()), c_ctx.get("policy"))
+        if flags["unmasked_profanity"]:
+            raise SystemExit("captions_reviewed: unmasked strong profanity in words.json; re-render")
+        if edit_gates.flag_reasons(flags) and len((a.note or "").split()) < 5:
+            raise SystemExit("captions_reviewed is flagged (" + "; ".join(edit_gates.flag_reasons(flags)) +
+                             "): --note with 5+ words is required")
+        extra["words_json_sha256"] = r["words_json_sha256"]
     entry = compliance.signoff(c, a.check, a.by or "", a.note or "", c_ctx)
     if a.check == "mixed_track_commentary_confirmed":
         c.setdefault("commentary", {})["commentary_source"] = "mixed_track_signed"
         compliance.evaluate(c, c_ctx)
     gatelog.append_review(root / "review_log.jsonl", action="signoff", check=a.check, by=entry["by"], note=entry["note"],
-                          clip=c["file"], file_sha256=gatelog.sha256_file(root / c["file"]))
+                          clip=c["file"], file_sha256=gatelog.sha256_file(root / c["file"]), **extra)
 
 
 def cmd_approve(a, root, m, c_ctx):
     c = find(m, a.clip)
     b = compliance.blockers(c, c_ctx)
     entries = gatelog.verify_review_log(root / "review_log.jsonl") if (root / "review_log.jsonl").exists() else []
-    unsigned = unsigned_human_checks(c, entries, gatelog.sha256_file(root / c["file"]))
+    unsigned = unsigned_human_checks(c, entries, gatelog.sha256_file(root / c["file"]), root)
     if unsigned:
         b.update({n: "no signed sign-off for the current file" for n in unsigned})
     if b:
@@ -306,7 +417,7 @@ def build_package(root, c, packages, c_ctx):
     entries = gatelog.verify_review_log(root / "review_log.jsonl")
     appr = gatelog.latest_approval(entries, c["file"])
     file_sha = gatelog.sha256_file(root / c["file"])
-    unsigned = unsigned_human_checks(c, entries, file_sha)
+    unsigned = unsigned_human_checks(c, entries, file_sha, root)
     if unsigned:
         raise SystemExit("human checks without a signed sign-off for this exact file: " + ", ".join(unsigned))
     if (not appr or appr["file_sha256"] != file_sha or appr["metadata_sha256"] != gatelog.sha256_json(c["metadata"])
@@ -322,7 +433,12 @@ def build_package(root, c, packages, c_ctx):
               "paidProductPlacement": c["paid_promotion"]["value"] == "present"}
     pkg = {"schema": "cutscenecity.upload-package/4",
            "style": {"voice_preset": (c.get("commentary") or {}).get("voice_preset") or "",
-                     "caption_style": (c.get("render") or {}).get("caption_style") or ""}, "clip": c["file"], "upload": upload, "file_sha256": file_sha,
+                     "caption_style": (c.get("render") or {}).get("caption_style") or "",
+                     "edit_style": (c.get("render") or {}).get("edit_style") or "off",
+                     "edit_effects": list((c.get("render") or {}).get("edit_effects") or [])},
+           "captions": ({"file": edit_gates.WORDS_PACKAGE_NAME, "words_json_sha256": c["render"]["words_json_sha256"]}
+                        if edit_gates.captions_burned(c.get("render")) else None),
+           "clip": c["file"], "upload": upload, "file_sha256": file_sha,
            "source": {"url": c["provenance"]["source_url"], "vod_id": gatelog.vod_id(c["provenance"]["source_url"]),
                       "channel": c["provenance"]["source_channel_name"],
                       "start_ms": int(round(float(c["start"]) * 1000)), "end_ms": int(round(float(c["end"]) * 1000))},
@@ -331,6 +447,8 @@ def build_package(root, c, packages, c_ctx):
     out = pathlib.Path(packages) / (pathlib.Path(c["file"]).stem + "-" + pkg["package_sha256"][:12])
     out.mkdir(parents=True, exist_ok=False)
     shutil.copy2(root / c["file"], out / "video.mp4")
+    if pkg["captions"]:
+        shutil.copy2(root / c["render"]["words_json"], out / edit_gates.WORDS_PACKAGE_NAME)
     (out / "package.json").write_text(json.dumps(pkg, indent=2))
     (out / "clip.json").write_text(json.dumps(c, indent=2))
     shutil.copy2(root / "review_log.jsonl", out / "review_log.jsonl")
@@ -351,7 +469,7 @@ def cmd_export(a, root, m, c_ctx):
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["status", "set", "precheck", "commentary", "script", "paid", "signoff", "approve", "export"])
+    p.add_argument("command", choices=["status", "set", "precheck", "commentary", "edit", "script", "paid", "signoff", "approve", "export"])
     p.add_argument("--value", help="paid: none | present")
     p.add_argument("--output", default="output")
     p.add_argument("--clip")
@@ -360,14 +478,19 @@ def main(argv=None):
     p.add_argument("--mic", help="creator mic stem file on the VOD timeline")
     p.add_argument("--mic-stream", type=int, help="audio stream index of the mic in an OBS multitrack source")
     p.add_argument("--voice-preset", help="TTS voice preset name from editorial-policy.json (rotation)")
-    p.add_argument("--caption-style", help="caption style name from editorial-policy.json (rotation)")
+    p.add_argument("--caption-style", help="edit: word caption style from editorial-policy.json word_caption_styles (rotation)")
+    p.add_argument("--style", default=None, help="edit: clean (default) | hype (opt-in) | off; per-clip human choice")
+    p.add_argument("--effects", help="edit: comma list of " + ",".join(edit_gates.EFFECTS) + " allowed for the style, or none")
+    p.add_argument("--flash-intensity", type=float, default=None, help="edit: flash_cut intensity, > 0 and <= 0.5 (default 0.5)")
+    p.add_argument("--no-render", action="store_true", help="edit: record the choice only (applied at the next re-render)")
     p.add_argument("--tts", action="store_true")
     p.add_argument("--music-volume", type=float, default=None,
                    help="game/music bed level 0<v<=1 (default env CUTSCENECITY_MUSIC_VOLUME or 1.0 = original audio unchanged)")
     p.add_argument("--upscale", default=None, help="commentary re-render: 2160 (default) | 1440 | off; env CUTSCENECITY_UPSCALE")
-    p.add_argument("--strip-game-audio", action="store_true", help="opt-in: drop ALL game/music audio (mic + voiceover only)")
-    p.add_argument("--edit-style", default=None, choices=("off", "clean", "hype"), help="edit stage (default hype; env CUTSCENECITY_EDIT_STYLE)")
-    p.add_argument("--captions", action="store_true")
+    p.add_argument("--strip-game-audio", action="store_true", help="default since phase 2.7 (kept for old scripts; no effect)")
+    p.add_argument("--keep-game-audio", action="store_true", help="opt-in: keep game/music audio under the mic (audio_mode mix)")
+    p.add_argument("--edit-style", default=None, help=argparse.SUPPRESS)   # phase 2.7: use review.py edit
+    p.add_argument("--captions", action="store_true", help=argparse.SUPPRESS)  # phase 2.7: review.py edit --effects captions
     p.add_argument("--check")
     p.add_argument("--by")
     p.add_argument("--note")
