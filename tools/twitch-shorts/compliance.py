@@ -374,7 +374,7 @@ def script_originality_gate(clip, ctx):
 def rotation_gate(clip, ctx):
     pol = ctx.get("policy") or {}
     voices = [v["name"] for v in pol.get("voice_presets", [])]
-    styles = list((pol.get("caption_styles") or {}).keys())
+    styles = list((pol.get("caption_styles") or {}).keys()) + list((pol.get("word_caption_styles") or {}).keys())
     prev = ctx.get("previous_upload") or {}
     c, r = clip.get("commentary") or {}, clip.get("render") or {}
     out = []

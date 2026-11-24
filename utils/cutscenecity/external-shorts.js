@@ -247,7 +247,7 @@ function checkClipGates(clip, { env, policy, spoilerTerms, history = [], previou
     if (st === 'WARN' && String(script.similarity_note || '').split(/\s+/).filter(Boolean).length < 5) p.push(`script reuse: ${why2} (needs reviewer note)`);
   }
   const voices = (policy.voice_presets || []).map(v => v.name);
-  const styles = Object.keys(policy.caption_styles || {});
+  const styles = [...Object.keys(policy.caption_styles || {}), ...Object.keys(policy.word_caption_styles || {})];
   if (c.tts_used) {
     if (!voices.includes(c.voice_preset)) p.push(`voice preset ${c.voice_preset} not in policy`);
     else if (previous && previous.voice_preset === c.voice_preset) p.push(`voice preset ${c.voice_preset} repeats the previous upload`);

@@ -191,7 +191,9 @@ def cmd_commentary(a, root, m, c_ctx):
                                 game_volume=render.music_volume(a.music_volume), commentary=str(voice) if voice else None,
                                 mic=a.mic, mic_stream=a.mic_stream, blur_regions=prev.get("blur_regions") or [],
                                 caption_style=styles.get(a.caption_style) if a.captions else None,
-                                caption_style_name=a.caption_style if a.captions else None, upscale=a.upscale)
+                                caption_style_name=a.caption_style if a.captions else None, upscale=a.upscale,
+                                edit_style=a.edit_style,
+                                word_caption_style=a.caption_style if a.caption_style in render.edit_stage.WORD_STYLES else None)
     c["render"]["facecam"] = prev.get("facecam")
     c["render"]["profile"] = prev.get("profile")
     c["commentary"] = {"path": str(voice) if voice else None, "mic_source": c["render"]["mic_source"],
@@ -364,6 +366,7 @@ def main(argv=None):
                    help="game/music bed level 0<v<=1 (default env CUTSCENECITY_MUSIC_VOLUME or 1.0 = original audio unchanged)")
     p.add_argument("--upscale", default=None, help="commentary re-render: 2160 (default) | 1440 | off; env CUTSCENECITY_UPSCALE")
     p.add_argument("--strip-game-audio", action="store_true", help="opt-in: drop ALL game/music audio (mic + voiceover only)")
+    p.add_argument("--edit-style", default=None, choices=("off", "clean", "hype"), help="edit stage (default hype; env CUTSCENECITY_EDIT_STYLE)")
     p.add_argument("--captions", action="store_true")
     p.add_argument("--check")
     p.add_argument("--by")

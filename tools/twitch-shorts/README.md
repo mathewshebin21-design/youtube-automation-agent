@@ -80,3 +80,19 @@ Run GitHub Actions workflow **CutsceneCity Twitch VOD Shorts (review only)** man
 
 - Shebin approved raising the cap from 1 to 2 uploads per day. The hard clamp is `min(cap, 2)` in `gatelog.py` and `external-shorts.js`, and `daily_upload_cap` defaults to 2 in `editorial-policy.json` and `.env.example`.
 - Unchanged: 0, negative or unreadable values block all uploads; values above 2 clamp to 2; the day boundary is the IST calendar day (UTC+05:30); every upload is still private-only and needs its own human approval; `upload_private.py` and the Node route both re-check the cap and duplicates against the shared ledger.
+
+## Edit stage: captions, animations and effects (Phase 2.6, ON by default: `hype`)
+
+- `--edit-style off|clean|hype` on `pipeline.py --render` and `review.py commentary`, or env `CUTSCENECITY_EDIT_STYLE`. **Default `hype`.** `clean` = word-by-word captions only. `off` = no edit pass (the old `--captions` SRT path still works); the test suite sets `CUTSCENECITY_EDIT_STYLE=off` to stay fast.
+- Order: ffmpeg render (layout, blur regions, audio mix + loudnorm) → **edit (captions/effects)** → upscale (default 2160x3840) → `qa.py` → overlay scan / `review.py precheck` → export SHA-256. The package SHA binds the final edited + upscaled file.
+- ffmpeg + libass only (`tools/twitch-shorts/edit.py`). No paid services, stock assets, added music or SFX. The edit pass copies the audio stream (`-c:a copy`), so the original audio and `--music-volume` are untouched.
+- **Word-by-word captions:** faster-whisper word timestamps (`CUTSCENECITY_WHISPER_MODEL`, default `small`; a local model path works). ASS events reveal the words of a 1-3 word group one by one; the current word pops in (130% → 100% over 120 ms) and is highlighted. Bold white Liberation Sans, black outline, MarginV 360 px (above the bottom 15% of 1920). Captions are the exact transcribed words; only ASS control characters `\ { }` are dropped. Swear words are kept as said. Files: `short_NN.words.ass`, `short_NN.words.json`. Transcription is two-pass: Silero VAD (threshold 0.25) first; only if that finds no words, a no-VAD pass whose low-confidence (avg_logprob < -1.0, no_speech_prob > 0.6, compression > 2.4) and repeated segments are dropped, never rewritten (`render.transcribe_mode`). On mixed-track VODs with loud game audio, whisper often hears only a few lines, so captions can be sparse and may contain mishearings: they stay `..._NEEDS_HUMAN_CHECK`. If faster-whisper is missing or no speech is found, captions are skipped and recorded.
+- Caption highlight styles live in `editorial-policy.json` `word_caption_styles` (`word-pop-yellow` default, `word-pop-cyan`, `word-pop-green`; choose with `--caption-style`). Burned word captions set `render.captions = BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK`, so the existing caption-style rotation gate (Python and Node) applies: the style must be in the policy and may not repeat the previous upload.
+- **hype effects:**
+  - Punch-in zoom ~1.15x (zoompan expression, smoothstep ease in 0.3 s, hold 0.5 s, ease out 0.3 s) on audio-energy spikes: ≥ 4.5 dB above the median of the previous 3 s, measured on the ORIGINAL source audio (loudnorm flattens spikes), strongest first, never closer than 4 s (max 1 per 4 s). A 0.2 s shake (±10 px) on the top 1-2 spikes.
+  - Hook: 1.1 → 1.0 zoom-out over the first 0.5 s. 0.3 s video fade-out at the end (audio not faded).
+  - Thin progress bar (10 px, white) along the bottom edge.
+  - Flash cut: `--join-adjacent` joins two picks that touch end-to-start into one clip (≤ 60 s); `--flash-cut` adds a 0.16 s white flash at that join. Both off by default.
+- `render` records `edit_style`, `zoom_count`, `punch_ins`, `shake_at`, `word_captions`, `word_count`, `edit_seconds`.
+- `--window START-END` (repeatable) renders exact windows (seconds in the input file) instead of auto-selection.
+- The transformation note stays Shebin's own text; nothing here writes it.
