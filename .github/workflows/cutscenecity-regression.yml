@@ -1,0 +1,28 @@
+name: CutsceneCity regression
+on:
+  push:
+    branches: [cutscenecity-phase2.8-stabilization]
+  pull_request:
+    branches: [master, cutscenecity-phase2.7-compliance]
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CUTSCENECITY_UPSCALE: off
+      CUTSCENECITY_EDIT_STYLE: off
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install -r tools/twitch-shorts/requirements.txt
+      - run: npm ci
+      - run: npm run test:cutscenecity
+      - run: npm test
