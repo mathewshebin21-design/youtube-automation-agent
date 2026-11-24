@@ -9,7 +9,8 @@ const os = require('os');
 const path = require('path');
 const {
   ExternalShortsService, registerExternalShortsRoutes, canonicalJson, validateImport, checkClipGates, isMixedTrack, loadPolicy, ownerMatch, checkScript, effectiveDailyCap, REQUIRED_HUMAN_CHECKS,
-  captionFlags, renderEditProblems, STYLE_EFFECTS, FLASH_MAX_PER_CLIP, FLASH_MAX_INTENSITY, mixedTrackAllowed, HARD_DAILY_CAP
+  captionFlags, renderEditProblems, STYLE_EFFECTS, FLASH_MAX_PER_CLIP, FLASH_MAX_INTENSITY, MIXED_REMOVED, HARD_DAILY_CAP, MIN_LIVE_VOICE, liveVoiceCoverage, musicNoteProblems, signEntry,
+  audioProfanityProblems, audioProfanityState, bleepSegments, titleThumbnailProfanity
 } = require('../utils/cutscenecity/external-shorts');
 
 const PY = process.env.CUTSCENECITY_PYTHON || 'python3';
@@ -344,34 +345,25 @@ test('paid promotion: explicit true for present, missing blocks, tamper blocks',
   assert.throws(() => makePackage(path.join(ctx.work, 'nopaid'), ['--paid', 'skip', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /paid_promotion/);
 });
 
-test('mixed-track path (opt-in): creator-owned + signed confirmation passes; unsigned, lowered or foreign is blocked', async t => {
-  process.env.CUTSCENECITY_ALLOW_MIXED_TRACK = 'true'; // phase 2.7: off by default; the Python fixture inherits this
+test('2.8 A: mixed-track bypass removed: env and policy opt-ins cannot restore a pass; Python refuses to export', async t => {
+  process.env.CUTSCENECITY_ALLOW_MIXED_TRACK = 'true'; // ignored since phase 2.8; the Python fixture inherits this
   t.after(() => { delete process.env.CUTSCENECITY_ALLOW_MIXED_TRACK; });
-  const ctx = await setup(t, { pkgArgs: ['--mixed'], env: { CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' } });
-  const { body, dir } = ctx.pkgs[0];
-  const clip = JSON.parse(fs.readFileSync(path.join(dir, 'clip.json'), 'utf8'));
-  assert.ok(isMixedTrack(clip));
-  assert.equal(clip.commentary.commentary_source, 'mixed_track_signed');
-  const ing = await ctx.call('POST', '/api/gta6/external-shorts', body);
-  assert.equal(ing.status, 201, JSON.stringify(ing.json));
-  const { policy, spoilerTerms } = loadPolicy(path.join(__dirname, '..', 'tools', 'twitch-shorts'));
-  const opts = { env: ctx.env, policy, spoilerTerms, history: [] };
-  assert.deepEqual(checkClipGates(clip, opts), []);
-  const unsigned = { ...clip, commentary: { ...clip.commentary, commentary_source: null } };
-  assert.match(checkClipGates(unsigned, opts).join(' '), /mixed_track_commentary_confirmed/);
-  const lowered = { ...clip, render: { ...clip.render, music_volume: 0.5 } };
-  assert.match(checkClipGates(lowered, opts).join(' '), /full level/);
-  const foreign = { ...clip, provenance: { ...clip.provenance, source_owner: { ...clip.provenance.source_owner, uploader_id: 'otherstreamer' } } };
-  const fp = checkClipGates(foreign, opts).join(' ');
-  assert.match(fp, /not the owner/);
-  assert.match(fp, /only creator-owned VODs/);
-  // the human sign-off needs 5+ words and must exist in the signed log
-  assert.throws(() => makePackage(path.join(ctx.work, 'short'), ['--mixed', '--start', '200', '--mixed-note', 'audible'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
-  const lines = fs.readFileSync(path.join(dir, 'review_log.jsonl'), 'utf8').trim().split('\n');
-  assert.ok(lines.some(l => JSON.parse(l).check === 'mixed_track_commentary_confirmed'));
+  const ctx = await setup(t, { env: { CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' } });
+  const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
+  const { policy, spoilerTerms } = loadPolicy(TOOLS);
+  assert.equal('mixed_track_path_enabled' in policy, false);
+  const mixed = { ...clip, commentary: { path: null, mic_source: null, tts_used: false, commentary_source: 'mixed_track_signed',
+    speech_seconds_combined: 20, speech_seconds_live: 20 }, render: { audio_mode: 'source', mic_source: null, music_volume: 1.0, captions: 'OFF' } };
+  for (const opts of [{ env: ctx.env, policy, spoilerTerms, history: [] },
+    { env: { ...ctx.env, CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' }, policy: { ...policy, mixed_track_path_enabled: true }, spoilerTerms, history: [] }]) {
+    const pr = checkClipGates(mixed, opts).join(' ');
+    assert.ok(pr.includes(MIXED_REMOVED), pr);
+    assert.match(pr, /live reaction/);
+  }
+  assert.throws(() => makePackage(path.join(ctx.work, 'mixed'), ['--mixed', '--start', '200'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
 });
 
-test('mic-stem packages do not need the mixed-track sign-off (stricter measured path preferred)', async t => {
+test('mic-stem packages pass without any mixed-track sign-off; < 60% measured commentary blocks', async t => {
   const ctx = await setup(t);
   const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
   assert.equal(isMixedTrack(clip), false);
@@ -505,7 +497,7 @@ test('2.7 fix 2+3: burned captions need a mic stem and a signed captions_reviewe
 
 test('2.7 fix 4+5: profanity masked + first-10s flag; story names/plot keywords flagged; placeholders marked incomplete', async t => {
   const { policy, spoilerTerms } = loadPolicy(TOOLS);
-  assert.equal(policy.caption_policy.audio_bleep, false);
+  assert.equal(policy.caption_policy.audio_bleep, 'per_clip_choice');
   assert.ok(policy.caption_policy.story_names.includes('Lucia') && policy.caption_policy.story_names.includes('Jason'));
   assert.ok(policy.caption_policy.story_names.some(n => n.startsWith('PLACEHOLDER')));
   const words = [
@@ -540,24 +532,158 @@ test('2.7 fix 8: flash cut at most 1 per clip and intensity <= 0.5 (Node gate + 
   assert.throws(() => makePackage(path.join(ctx.work, 'two'), ['--edit', 'hype', '--effects', 'flash_cut', '--flash-cuts', '2'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
 });
 
-test('2.7 defaults: separate mic required (mixed track off unless opted in), game audio stripped unless opted in', async t => {
+test('2.8 override: game audio KEPT by default (mix, no opt-in); stripping is opt-in; mic stem still required', async t => {
   const { policy, spoilerTerms } = loadPolicy(TOOLS);
-  assert.equal(policy.mixed_track_path_enabled, false);
-  assert.equal(policy.game_audio_default, 'stripped');
+  assert.equal(policy.game_audio_default, 'kept');
   assert.equal(policy.daily_upload_cap, 1);
   assert.equal(policy.edit_policy.default_edit_style, 'clean');
-  assert.equal(mixedTrackAllowed({}, policy), false);
-  assert.equal(mixedTrackAllowed({ CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' }, policy), true);
+  const ctx = await setup(t, { packages: 2, pkgArgs: i => (i === 0 ? [] : ['--start', '200', '--strip-game-audio']) });
+  const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
+  assert.equal(clip.render.audio_mode, 'mix');
+  assert.equal(clip.render.keep_game_audio_opt_in, undefined);
+  const opts = { env: ctx.env, policy, spoilerTerms, history: [] };
+  assert.deepEqual(checkClipGates(clip, opts), []);                            // kept game audio needs no opt-in
+  const stripped = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[1].dir, 'clip.json'), 'utf8'));
+  assert.equal(stripped.render.audio_mode, 'mic_stem');
+  assert.deepEqual(checkClipGates(stripped, opts), []);
+  for (const p of ctx.pkgs) assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', p.body)).status, 201);
+  // game audio + voiceover but no mic stem: still refused (60% is measured on the mic stem; no mixed-track bypass)
+  const noMic = { ...clip, commentary: { ...clip.commentary, mic_source: null }, render: { ...clip.render, audio_mode: 'source', mic_source: null, mic_gain: null } };
+  const pr = checkClipGates(noMic, opts).join(' ');
+  assert.ok(pr.includes(MIXED_REMOVED));
+  assert.match(pr, /live reaction/);
+});
+
+test('2.8 D: audio profanity record recomputed; first 10 s blocks unless bleeped; bleep must match the signed choice', async t => {
+  const { policy, spoilerTerms } = loadPolicy(TOOLS);
+  assert.ok(REQUIRED_HUMAN_CHECKS.includes('profanity_audio_reviewed'));
+  assert.deepEqual(bleepSegments([{ start_ms: 1000, end_ms: 1400 }, { start_ms: 1420, end_ms: 1800 }]), [[950, 1850]]);
+  const hits = [{ word: 'f******', start_ms: 2500, end_ms: 2900 }];
+  const rec = { status: 'SCANNED', source: 'mic_stream:1', terms: 1, hits, mix_status: 'SCANNED', mix_hits: [], bleep: 'off', bleeped_segments: [] };
+  assert.deepEqual(audioProfanityState(rec, policy).unbleepedFirst10s, [2500]);
+  assert.match(audioProfanityProblems({ render: { profanity_audio: rec } }, policy).join(' '), /first 10 s is not bleeped/);
+  const bleeped = { ...rec, bleep: 'tone', bleeped_segments: [[2450, 2950]] };
+  assert.deepEqual(audioProfanityProblems({ render: { profanity_audio: bleeped }, edit_choice: { bleep: 'tone' } }, policy), []);
+  assert.match(audioProfanityProblems({ render: { profanity_audio: bleeped }, edit_choice: { bleep: 'off' } }, policy).join(' '), /differs/);
+  // tampered record: saved state says clean but the segments do not cover the hit -> recomputed, blocked
+  const lying = { ...bleeped, bleeped_segments: [[5000, 5400]], unbleeped_first_10s_ms: [] };
+  assert.match(audioProfanityProblems({ render: { profanity_audio: lying }, edit_choice: { bleep: 'tone' } }, policy).join(' '), /not bleeped/);
+  assert.match(audioProfanityProblems({ render: {} }, policy).join(' '), /not scanned/);
+  assert.match(audioProfanityProblems({ render: { profanity_audio: { ...rec, hits: [], status: 'UNAVAILABLE_NO_FASTER_WHISPER' } } }, policy).join(' '), /UNAVAILABLE/);
+  // real packages: bleeped first-10s swear ingests; unbleeped is refused by Python; short note refused
+  const ctx = await setup(t, { pkgArgs: ['--audio-words', 'oh shit nice', '--bleep', 'tone', '--audio-note', 'listened twice, the swear is fully bleeped'] });
+  const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
+  assert.deepEqual(clip.render.profanity_audio.bleeped_segments, [[2450, 2950]]);
+  assert.deepEqual(checkClipGates(clip, { env: ctx.env, policy, spoilerTerms, history: [] }), []);
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body)).status, 201);
+  assert.throws(() => makePackage(path.join(ctx.work, 'unbleeped'), ['--audio-words', 'oh shit', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  assert.throws(() => makePackage(path.join(ctx.work, 'note'), ['--audio-words', 'shit', '--audio-start', '14', '--audio-note', 'ok', '--start', '400'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+});
+
+test('2.8 D: profanity_audio_reviewed must be signed and pinned to the final file + scan hash', async t => {
+  const ctx = await setup(t, { pkgArgs: ['--audio-words', 'shit', '--audio-start', '14', '--audio-note', 'one swear at 14 s, acceptable for the channel'] });
+  // Python refuses to approve/export without the sign-off
+  assert.throws(() => makePackage(path.join(ctx.work, 'nosign'), ['--skip-audio-review', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  const lines = fs.readFileSync(path.join(ctx.pkgs[0].dir, 'review_log.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  const so = lines.filter(l => l.check === 'profanity_audio_reviewed').pop();
+  assert.equal(so.final_sha256, so.file_sha256);
+  // tamper the scan record after signing: the hash no longer matches the signed review -> ingest refuses
+  const { dir, body } = ctx.pkgs[0];
+  const cp = path.join(dir, 'clip.json');
+  const clip = JSON.parse(fs.readFileSync(cp, 'utf8'));
+  clip.render.profanity_audio.hits = [];
+  clip.render.profanity_audio.hit_count = 0;
+  clip.render.profanity_audio.unbleeped_ms = [];
+  fs.writeFileSync(cp, JSON.stringify(clip));
+  const r1 = await ctx.call('POST', '/api/gta6/external-shorts', body);
+  assert.notEqual(r1.status, 201);
+  assert.match(JSON.stringify(r1.json), /profanity_audio_reviewed: no signed review pinned/);
+});
+
+test('2.8 D: title and thumbnail text must be free of strong profanity', async t => {
+  const { policy } = loadPolicy(TOOLS);
+  assert.deepEqual(titleThumbnailProfanity({ title: 'Flanked on the docks', thumbnail_text: 'NO WAY' }, policy), []);
+  assert.match(titleThumbnailProfanity({ title: 'what the FUCK', thumbnail_text: '' }, policy).join(' '), /title/);
+  assert.doesNotMatch(titleThumbnailProfanity({ title: 'what the FUCK' }, policy).join(' '), /FUCK/);
+  assert.match(titleThumbnailProfanity({ thumbnail_text: 'shit-show' }, policy).join(' '), /thumbnail_text/);
   const ctx = await setup(t);
   const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
-  const opts = { env: ctx.env, policy, spoilerTerms, history: [] };
-  const mixed = { ...clip, commentary: { path: null, mic_source: null, tts_used: false, commentary_source: 'mixed_track_signed' },
-    render: { audio_mode: 'source', mic_source: null, music_volume: 1.0, captions: 'OFF' } };
-  assert.match(checkClipGates(mixed, opts).join(' '), /separate mic track required/);
-  assert.doesNotMatch(checkClipGates(mixed, { ...opts, env: { ...ctx.env, CUTSCENECITY_ALLOW_MIXED_TRACK: 'true' } }).join(' '), /separate mic track required/);
-  const kept = { ...clip, render: { ...clip.render, audio_mode: 'mix', music_volume: 1.0 } };
-  assert.match(checkClipGates(kept, opts).join(' '), /--keep-game-audio opt-in/);
-  assert.doesNotMatch(checkClipGates({ ...kept, render: { ...kept.render, keep_game_audio_opt_in: true } }, opts).join(' '), /keep-game-audio/);
-  // Python refuses to export a mixed-track package without the opt-in
-  assert.throws(() => makePackage(path.join(ctx.work, 'mixedoff'), ['--mixed', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  const { spoilerTerms } = loadPolicy(TOOLS);
+  const bad = { ...clip, metadata: { ...clip.metadata, thumbnail_text: 'SHIT' } };
+  assert.match(checkClipGates(bad, { env: ctx.env, policy, spoilerTerms, history: [] }).join(' '), /thumbnail_text/);
+  assert.throws(() => makePackage(path.join(ctx.work, 'thumb'), ['--thumbnail-text', 'BULLSHIT? no: SHIT', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
 });
+
+test('2.8.1 live-voice floor: mic stem only >= 30%; TTS tops up to 60% but cannot replace the creator', async t => {
+  const { policy, spoilerTerms } = loadPolicy(TOOLS);
+  assert.equal(MIN_LIVE_VOICE, 0.3);
+  assert.equal(policy.min_live_voice_coverage, 0.3);
+  const ctx = await setup(t, { pkgArgs: ['--tts', '--synthetic', '--live-seconds', '7', '--combined-seconds', '13'] });
+  const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
+  const opts = { env: ctx.env, policy, spoilerTerms, history: [] };
+  assert.equal(Math.round(liveVoiceCoverage(clip) * 100), 35);
+  assert.deepEqual(checkClipGates(clip, opts), []);                                   // 35% mic + 30% TTS = PASS
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body)).status, 201);
+  const low = { ...clip, commentary: { ...clip.commentary, speech_seconds_live: 4, speech_seconds_combined: 14 } };
+  assert.match(checkClipGates(low, opts).join(' '), /creator live voice \(mic stem only\) must cover at least 30%/);  // 20% + 50%
+  const noMic = { ...clip, commentary: { ...clip.commentary, mic_source: null, speech_seconds_live: 0, speech_seconds_combined: 20 },
+    render: { ...clip.render, audio_mode: 'source', mic_source: null, mic_gain: null } };
+  const pr = checkClipGates(noMic, opts).join(' ');
+  assert.ok(pr.includes(MIXED_REMOVED));
+  assert.match(pr, /creator live voice/);
+  assert.match(checkClipGates(clip, { ...opts, policy: { ...policy, min_live_voice_coverage: 0.5 } }).join(' '), /at least 50%/);
+  // Python refuses to export 20% mic + 50% TTS
+  assert.throws(() => makePackage(path.join(ctx.work, 'low'), ['--tts', '--synthetic', '--live-seconds', '4', '--combined-seconds', '14', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+});
+
+test('2.8.1 music_risk_cleared note: Node enforces 5+ words itself whenever audio_mode is mix or source', () => {
+  const e = { action: 'signoff', check: 'music_risk_cleared', clip: 'short_01.mp4', file_sha256: 'f'.repeat(64), note: 'listened to the whole clip, no radio' };
+  for (const mode of ['mix', 'source']) {
+    const clip = { file: 'short_01.mp4', render: { audio_mode: mode } };
+    assert.deepEqual(musicNoteProblems(clip, [e], 'f'.repeat(64)), []);
+    assert.match(musicNoteProblems(clip, [{ ...e, note: 'ok fine' }], 'f'.repeat(64)).join(' '), /5\+ words/);
+    assert.match(musicNoteProblems(clip, [], 'f'.repeat(64)).join(' '), /5\+ words/);
+    assert.match(musicNoteProblems(clip, [e, { ...e, note: 'fine' }], 'f'.repeat(64)).join(' '), /5\+ words/);   // latest counts
+  }
+  assert.deepEqual(musicNoteProblems({ file: 'short_01.mp4', render: { audio_mode: 'mic_stem' } }, [], 'f'.repeat(64)), []);
+});
+
+test('2.8.1 full-mix profanity: game dialogue scanned, first 10 s blocks unless bleeped, full-mix confirmation signed', async t => {
+  const { policy } = loadPolicy(TOOLS);
+  const mixHit = [{ word: 'f***', start_ms: 4000, end_ms: 4400 }];
+  const rec = { status: 'SCANNED', hits: [], mix_status: 'SCANNED', mix_hits: mixHit, bleep: 'off', bleeped_segments: [] };
+  assert.match(audioProfanityProblems({ render: { profanity_audio: rec } }, policy).join(' '), /first 10 s is not bleeped/);
+  const b = { ...rec, bleep: 'mute', bleeped_segments: [[3950, 4450]] };
+  assert.deepEqual(audioProfanityProblems({ render: { profanity_audio: b }, edit_choice: { bleep: 'mute' } }, policy), []);
+  const { mix_status: _ms, ...noMix } = b;
+  assert.match(audioProfanityProblems({ render: { profanity_audio: noMix }, edit_choice: { bleep: 'mute' } }, policy).join(' '), /full-mix scan NOT_SCANNED/);
+  const ctx = await setup(t, { pkgArgs: ['--mix-words', 'fuck', '--mix-start', '4', '--bleep', 'tone', '--audio-note', 'game npc swears at 4 s, fully bleeped'] });
+  const clip = JSON.parse(fs.readFileSync(path.join(ctx.pkgs[0].dir, 'clip.json'), 'utf8'));
+  assert.deepEqual(clip.render.profanity_audio.bleeped_segments, [[3950, 4450]]);
+  assert.equal((await ctx.call('POST', '/api/gta6/external-shorts', ctx.pkgs[0].body)).status, 201);
+  const W = n => path.join(ctx.work, n);
+  assert.throws(() => makePackage(W('unbleeped'), ['--mix-words', 'fuck', '--mix-start', '4', '--start', '200'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  assert.throws(() => makePackage(W('nomix'), ['--no-mix-scan', '--start', '300'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+  assert.throws(() => makePackage(W('noconfirm'), ['--no-full-mix-confirm', '--start', '400'], ctx.env.CUTSCENECITY_STATE_DIR), /Command failed/);
+});
+
+test('2.8.1 Node ingest refuses a profanity_audio_reviewed sign-off without the first-10s full-mix confirmation', async t => {
+  const ctx = await setup(t);
+  const { dir, body } = ctx.pkgs[0];
+  const logPath = path.join(dir, 'review_log.jsonl');
+  // re-sign the whole log with the confirmation removed (simulates a sign-off made without it)
+  let prev = 'GENESIS';
+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').map(l => JSON.parse(l)).map(e => {
+    const { sig, ...rest } = e; // eslint-disable-line no-unused-vars
+    if (rest.check === 'profanity_audio_reviewed') delete rest.first_10s_full_mix_checked;
+    const n = { ...rest, prev };
+    n.sig = signEntry(n, REVIEW_KEY);
+    prev = n.sig;
+    return n;
+  });
+  fs.writeFileSync(logPath, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+  const r = await ctx.call('POST', '/api/gta6/external-shorts', body);
+  assert.notEqual(r.status, 201);
+  assert.ok(r.json.problems.includes('profanity_audio_reviewed: the sign-off must confirm the first 10 s of the FULL mix were listened to'), JSON.stringify(r.json));
+});
+

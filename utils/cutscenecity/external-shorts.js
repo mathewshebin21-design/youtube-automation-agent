@@ -15,7 +15,7 @@
  *   CUTSCENECITY_TTS_COUNTS_AS_COMMENTARY  default true (TTS counts toward 60% only with the AI disclosure)
  *   CUTSCENECITY_STATE_DIR        shared upload audit ledger (default ~/.cutscenecity)
  *   CUTSCENECITY_DAILY_CAP        overrides editorial-policy.json daily_upload_cap; clamped to max 1, <=0 or invalid = blocked; counted per IST day
- *   CUTSCENECITY_ALLOW_MIXED_TRACK  phase 2.7: mixed-track path (no separate mic) is OFF unless true (or policy mixed_track_path_enabled)
+ *   (CUTSCENECITY_ALLOW_MIXED_TRACK was removed in phase 2.8: no mixed-track bypass; a creator mic stem is always required)
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -24,10 +24,15 @@ const path = require('path');
 
 const TOOLS_DIR = path.join(__dirname, '..', '..', 'tools', 'twitch-shorts');
 const SIM = { flagAt: 0.40, rejectAbove: 0.50, nearLine: 0.80, history: 30, shingle: 3 };
-const REQUIRED_HUMAN_CHECKS = ['vod_rights_confirmed', 'no_story_cutscene', 'music_risk_cleared', 'overlays_third_parties_cleared'];
+const REQUIRED_HUMAN_CHECKS = ['vod_rights_confirmed', 'no_story_cutscene', 'music_risk_cleared', 'overlays_third_parties_cleared',
+  'profanity_audio_reviewed'];
 const HARD_DAILY_CAP = 1; // phase 2.7 (Compliance): back from 2 to 1; day boundary = IST (UTC+05:30)
-const mixedTrackAllowed = (env, policy) => ['1', 'true', 'yes', 'on'].includes(String((env || {}).CUTSCENECITY_ALLOW_MIXED_TRACK || '').trim().toLowerCase()) ||
-  Boolean((policy || {}).mixed_track_path_enabled);
+// Phase 2.8 (Compliance): the mixed-track bypass is gone. No env or policy flag can pass a clip without a measured mic stem.
+const MIXED_REMOVED = 'no separate creator mic stem: commentary must be measured (60% of runtime) on a mic stem; the mixed-track bypass was removed in phase 2.8 (CUTSCENECITY_ALLOW_MIXED_TRACK / mixed_track_path_enabled are ignored)';
+const BLEEP_MODES = ['off', 'tone', 'mute'];
+const BLEEP_PAD_MS = 50;
+const MIN_LIVE_VOICE = 0.30; // phase 2.8.1: creator live voice floor, mic stem ONLY (policy may only raise it)
+const MUSIC_NOTE_WORDS = 5;  // phase 2.8.1: music_risk_cleared note whenever game/source audio is in the final mix
 const ALLOWED_RESOLUTIONS = ['1080x1920', '1440x2560', '2160x3840'];
 const PAID_VALUES = ['none', 'present'];
 const YT_PART = 'snippet,status,paidProductPlacementDetails';
@@ -72,6 +77,75 @@ function captionFlags(words, policy, spoilerTerms = []) {
     keywordHits: hits,
     keywordListIncomplete: incomplete
   };
+}
+
+const profanityTerms = policy => (((policy || {}).caption_policy || {}).profanity_terms || []).map(t => String(t).toLowerCase()).filter(Boolean);
+
+/** Phase 2.8: same as edit_gates.bleep_segments (ints, merged, +/- 50 ms). */
+function bleepSegments(hits) {
+  const segs = [];
+  for (const h of [...hits].sort((a, b) => a.start_ms - b.start_ms)) {
+    const a = Math.max(0, h.start_ms - BLEEP_PAD_MS); const b = h.end_ms + BLEEP_PAD_MS;
+    if (segs.length && a <= segs[segs.length - 1][1]) segs[segs.length - 1][1] = Math.max(segs[segs.length - 1][1], b);
+    else segs.push([a, b]);
+  }
+  return segs;
+}
+
+const allHits = rec => [...((rec || {}).hits || []), ...((rec || {}).mix_hits || [])];
+
+/** Recomputed from mic hits + full-mix hits + bleeped_segments (never trusts stored flags). */
+function audioProfanityState(rec, policy) {
+  const firstMs = Number(((policy || {}).caption_policy || {}).profanity_warn_first_seconds ?? 10) * 1000;
+  const segs = (rec || {}).bleeped_segments || [];
+  const hits = allHits(rec);
+  const unbleeped = [...new Set(hits.filter(h => !segs.some(([a, b]) => a <= h.start_ms && h.end_ms <= b)).map(h => h.start_ms))].sort((a, b) => a - b);
+  return { hitCount: hits.length, mixHitCount: ((rec || {}).mix_hits || []).length, unbleeped, unbleepedFirst10s: unbleeped.filter(t => t < firstMs) };
+}
+
+/** Phase 2.8.1: creator live voice (mic stem only) share of the runtime. */
+function liveVoiceCoverage(clip) {
+  const c = clip.commentary || {};
+  const runtime = Number(clip.end) - Number(clip.start);
+  if (!c.mic_source || !(runtime > 0)) return 0;
+  return Number(c.speech_seconds_live || 0) / runtime;
+}
+
+/** Phase 2.8.1: independent re-check of the music_risk_cleared note when game/source audio is kept. */
+function musicNoteProblems(clip, entries, fileSha, clipFile) {
+  if (!['mix', 'source'].includes((clip.render || {}).audio_mode)) return [];
+  const so = entries.filter(e => e.action === 'signoff' && e.check === 'music_risk_cleared' && e.clip === (clipFile || clip.file) && e.file_sha256 === fileSha).pop();
+  if (!so || String(so.note || '').split(/\s+/).filter(Boolean).length < MUSIC_NOTE_WORDS) {
+    return [`music_risk_cleared: game/source audio is in the final mix; the signed sign-off needs a note of ${MUSIC_NOTE_WORDS}+ words (whole-clip listen for licensed music)`];
+  }
+  return [];
+}
+
+/** Phase 2.8 audio profanity rules (mic stem transcript): scanned, first 10 s bleeped, bleep = the human choice. */
+function audioProfanityProblems(clip, policy) {
+  const rec = (clip.render || {}).profanity_audio;
+  if (!rec) return ['profanity_audio: the mic stem was not scanned for profanity (review.py edit --by NAME [--bleep tone|mute])'];
+  const p = [];
+  if (rec.status !== 'SCANNED') p.push(`profanity_audio: scan ${rec.status}; failing closed`);
+  if (rec.mix_status !== 'SCANNED') p.push(`profanity_audio: full-mix scan ${rec.mix_status || 'NOT_SCANNED'} (game dialogue/voiceover not covered); failing closed`);
+  const st = audioProfanityState(rec, policy);
+  if (st.unbleepedFirst10s.length) p.push(`strong profanity in the first 10 s is not bleeped (at ${st.unbleepedFirst10s.join(', ')} ms)`);
+  if (!BLEEP_MODES.includes(rec.bleep || 'off')) p.push(`profanity_audio: unknown bleep mode ${rec.bleep}`);
+  const ec = clip.edit_choice;
+  if (ec && (ec.bleep || 'off') !== (rec.bleep || 'off')) p.push('profanity_audio: bleep differs from the recorded human edit choice');
+  if ((rec.bleep || 'off') !== 'off' && rec.status === 'SCANNED' && allHits(rec).length &&
+      JSON.stringify(rec.bleeped_segments) !== JSON.stringify(bleepSegments(allHits(rec)))) p.push('profanity_audio: bleeped segments do not cover the profanity hits');
+  return p;
+}
+
+/** Phase 2.8: strong profanity in the title / thumbnail text (package metadata). */
+function titleThumbnailProfanity(md, policy) {
+  const terms = profanityTerms(policy);
+  const out = [];
+  for (const [field, text] of [['title', (md || {}).title], ['thumbnail_text', (md || {}).thumbnail_text]]) {
+    if (String(text || '').split(/[\s/_-]+/).some(t => isProfane(t, terms))) out.push(`strong profanity in ${field}`);
+  }
+  return out;
 }
 
 const captionFlagged = f => Boolean(f.profanityFirst10s.length || f.keywordHits.length || f.keywordListIncomplete || f.profanityMasked);
@@ -298,24 +372,18 @@ function checkClipGates(clip, { env, policy, spoilerTerms, history = [], previou
   // Upscale (default 2160 in the Python render): only these final resolutions are accepted.
   if (r.upscale !== undefined && !(['off', '1440', '2160'].includes(String(r.upscale)) || String(r.upscale).startsWith('skipped'))) p.push(`render.upscale ${r.upscale} is not allowed (1440, 2160 or off)`);
   if (r.output_resolution !== undefined && !ALLOWED_RESOLUTIONS.includes(r.output_resolution)) p.push(`output resolution ${r.output_resolution} is not an accepted 9:16 size`);
-  const mixed = isMixedTrack(clip);
-  if (mixed) {
-    // Mixed-track path (single Twitch VOD track): creator-owned only, kept at full level, and a signed human confirmation.
-    if (!mixedTrackAllowed(env, policy)) p.push('mixed track: separate mic track required; the mixed-track path is off by default (opt-in CUTSCENECITY_ALLOW_MIXED_TRACK=true)');
-    if (!own) p.push('mixed track: only creator-owned VODs may use the mixed-track path');
-    if ((r.audio_mode || 'source') !== 'source' || Number(r.music_volume ?? 1) !== 1) p.push('mixed track must be kept unchanged at full level');
-    const conf = (clip.compliance || {}).mixed_track_commentary_confirmed || {};
-    if (conf.status !== 'PASS' || conf.not_applicable || c.commentary_source !== 'mixed_track_signed') {
-      p.push('mixed track: commentary not measurable; needs signed mixed_track_commentary_confirmed (commentary_source=mixed_track_signed)');
-    }
-  } else {
-    if (!['mix', 'mic_stem'].includes(r.audio_mode) || !r.mic_source || r.mic_gain !== 1) p.push('live reaction: creator mic stem must be in the mix at full level (no mute/duck)');
-    if (r.audio_mode === 'mix' && r.keep_game_audio_opt_in !== true) p.push('game audio kept without the --keep-game-audio opt-in (stripped by default)');
-    const runtime = Number(clip.end) - Number(clip.start);
-    const min = Math.max(0.6, Number(policy.min_commentary_coverage) || 0.6);
-    const speech = Number((ttsCounts(env) ? c.speech_seconds_combined : c.speech_seconds_live) || 0);
-    if (!c.mic_source || !(runtime > 0) || speech / runtime < min) p.push('commentary (VAD on mic + TTS bus) must cover at least 60% of runtime');
-  }
+  // Phase 2.8: no mixed-track bypass. The mic stem must be in the final mix and commentary is always measured on it.
+  if (isMixedTrack(clip)) p.push(MIXED_REMOVED);
+  if (!['mix', 'mic_stem'].includes(r.audio_mode) || !r.mic_source || r.mic_gain !== 1) p.push('live reaction: creator mic stem must be in the mix at full level (no mute/duck)');
+  // Phase 2.8 override: game audio is KEPT by default (mix); stripping (mic_stem) is the opt-in. No opt-in check.
+  const runtime = Number(clip.end) - Number(clip.start);
+  const min = Math.max(0.6, Number(policy.min_commentary_coverage) || 0.6);
+  const speech = Number((ttsCounts(env) ? c.speech_seconds_combined : c.speech_seconds_live) || 0);
+  if (!c.mic_source || !(runtime > 0) || speech / runtime < min) p.push('commentary (VAD on mic + TTS bus) must cover at least 60% of runtime');
+  const liveFloor = Math.max(MIN_LIVE_VOICE, Number(policy.min_live_voice_coverage) || MIN_LIVE_VOICE);
+  if (liveVoiceCoverage(clip) < liveFloor) p.push(`creator live voice (mic stem only) must cover at least ${Math.round(liveFloor * 100)}% of runtime (TTS cannot replace it)`);
+  p.push(...audioProfanityProblems(clip, policy));
+  p.push(...titleThumbnailProfanity(md, policy));
   const script = clip.commentary_script || {};
   if (c.tts_used && !script.text) p.push('TTS used: a human-edited, approved script is required');
   if (script.text) {
@@ -494,19 +562,25 @@ class ExternalShortsService {
       if (so && String(so.note || '').split(/\s+/).filter(Boolean).length < 5) p.push('overlays_third_parties_cleared: scan flagged or unavailable, sign-off needs a 5+ word note');
     }
     const humanChecks = REQUIRED_HUMAN_CHECKS.concat((policy.extra_human_checks || []).map(c => c.name));
-    if (isMixedTrack(clip)) {
-      humanChecks.push('mixed_track_commentary_confirmed');
-      const so = entries.filter(e => e.action === 'signoff' && e.check === 'mixed_track_commentary_confirmed' && e.clip === pkg.clip && e.file_sha256 === fileSha).pop();
-      if (so && String(so.note || '').split(/\s+/).filter(Boolean).length < 5) p.push('mixed_track_commentary_confirmed: signed note must have 5+ words');
-    }
     // Phase 2.7: signed per-clip edit choice, and captions_reviewed bound to the exact words.json + file.
     const r = clip.render || {};
-    if ((r.edit_style || 'off') !== 'off') {
+    const pa = r.profanity_audio;
+    if ((r.edit_style || 'off') !== 'off' || ((pa || {}).bleep || 'off') !== 'off') {
       const ec = clip.edit_choice || {};
       const so = entries.filter(e => e.action === 'edit_choice' && e.clip === pkg.clip).pop();
       if (!so) p.push('edit_choice: no signed per-clip human edit choice');
       else if (so.edit_style !== ec.edit_style || JSON.stringify(so.effects) !== JSON.stringify(ec.effects) ||
-               so.flash_intensity_pct !== ec.flash_intensity_pct || so.by !== ec.by) p.push('edit_choice: manifest choice differs from the signed choice');
+               so.flash_intensity_pct !== ec.flash_intensity_pct || so.by !== ec.by ||
+               (so.bleep || 'off') !== (ec.bleep || 'off')) p.push('edit_choice: manifest choice differs from the signed choice');
+    }
+    // Phase 2.8: profanity_audio_reviewed pinned to the final file SHA-256 and the profanity_audio record hash.
+    if (pa) {
+      const so = entries.filter(e => e.action === 'signoff' && e.check === 'profanity_audio_reviewed' && e.clip === pkg.clip && e.file_sha256 === fileSha).pop();
+      let paSha = null;
+      try { paSha = sha256Json(pa); } catch (e) { p.push(`profanity_audio record not canonical: ${e.message}`); }
+      if (!so || so.final_sha256 !== fileSha || so.profanity_audio_sha256 !== paSha) p.push('profanity_audio_reviewed: no signed review pinned to this exact final file + audio scan');
+      else if (so.first_10s_full_mix_checked !== true) p.push('profanity_audio_reviewed: the sign-off must confirm the first 10 s of the FULL mix were listened to');
+      else if (allHits(pa).length && noteWords(so.note) < 5) p.push('profanity_audio_reviewed: profanity found, the sign-off needs a 5+ word note');
     }
     if (captionsBurned(r)) {
       humanChecks.push('captions_reviewed');
@@ -524,6 +598,7 @@ class ExternalShortsService {
         if (so && captionFlagged(flags) && noteWords(so.note) < 5) p.push('captions_reviewed: flagged captions need a 5+ word reviewer note');
       }
     }
+    p.push(...musicNoteProblems(clip, entries, fileSha, pkg.clip));   // phase 2.8.1: independent of Python's hint
     const signed = new Set(entries.filter(e => e.action === 'signoff' && e.clip === pkg.clip && e.file_sha256 === fileSha).map(e => e.check));
     humanChecks.filter(n => !signed.has(n)).forEach(n => p.push(`${n}: no signed human sign-off for this file`));
     p.push(...checkClipGates(clip, { env: this.env, policy, spoilerTerms, history: this.readHistory(), previous: this.previousUpload(pkg.package_sha256) }));
@@ -626,4 +701,4 @@ function registerExternalShortsRoutes(app, getService, { env = process.env } = {
   });
 }
 
-module.exports = { mixedTrackAllowed, HARD_DAILY_CAP, captionFlags, renderEditProblems, STYLE_EFFECTS, FLASH_MAX_PER_CLIP, FLASH_MAX_INTENSITY, ExternalShortsService, isMixedTrack, checkClipGates, loadPolicy, ownerMatch, checkScript, clipKey, effectiveDailyCap, REQUIRED_HUMAN_CHECKS, registerExternalShortsRoutes, canonicalJson, sha256Json, signEntry, verifyReviewLog, validateImport, GateError };
+module.exports = { MIN_LIVE_VOICE, liveVoiceCoverage, musicNoteProblems, MIXED_REMOVED, audioProfanityProblems, audioProfanityState, bleepSegments, titleThumbnailProfanity, HARD_DAILY_CAP, captionFlags, renderEditProblems, STYLE_EFFECTS, FLASH_MAX_PER_CLIP, FLASH_MAX_INTENSITY, ExternalShortsService, isMixedTrack, checkClipGates, loadPolicy, ownerMatch, checkScript, clipKey, effectiveDailyCap, REQUIRED_HUMAN_CHECKS, registerExternalShortsRoutes, canonicalJson, sha256Json, signEntry, verifyReviewLog, validateImport, GateError };

@@ -39,6 +39,18 @@ def make_vod(path, seconds=60):
     # stream 0:a:0 = game/music mix, 0:a:1 = creator mic (OBS multitrack layout)
 
 
+def _clean_audio(words=(), bleep="off"):
+    import edit_gates
+    return edit_gates.audio_profanity_record(list(words), bleep, "mic_stream:1", mix_words=[])
+
+
+def _pa_signoff(rec=None, file_sha="f" * 64, clip="short_01.mp4", note="listened to the whole clip for profanity"):
+    import edit_gates
+    return {"action": "signoff", "check": "profanity_audio_reviewed", "clip": clip, "file_sha256": file_sha,
+            "final_sha256": file_sha, "profanity_audio_sha256": edit_gates.sha256_record(rec or _clean_audio()), "note": note,
+            "first_10s_full_mix_checked": True}
+
+
 def good_clip(**over):
     c = {"file": "short_01.mp4", "start": 0.0, "end": 20.0,
          "provenance": {"source_platform": "twitch", "source_url": "https://www.twitch.tv/videos/1234567890",
@@ -51,7 +63,8 @@ def good_clip(**over):
          "transformation_note": " ".join(["word"] * 30),
          "commentary": {"path": None, "mic_source": "stream:1", "speech_seconds_live": 14.0,
                         "speech_seconds_combined": 14.0, "tts_used": False},
-         "render": {"audio_mode": "mic_stem", "mic_source": "stream:1", "mic_gain": 1.0, "captions": "OFF"},
+         "render": {"audio_mode": "mic_stem", "mic_source": "stream:1", "mic_gain": 1.0, "captions": "OFF",
+                    "profanity_audio": _clean_audio()},
          "technical_qa": {"status": "PASS_TECHNICAL_ONLY"}, "paid_promotion": {"value": "none"}}
     c.update(over)
     return compliance.init_clip(c)
@@ -136,7 +149,8 @@ class Gates(unittest.TestCase):
         self.assertIn("no TTS", c["synthetic_disclosure_reason"])
 
     def test_good_clip_only_waits_for_humans(self):
-        self.assertEqual(set(compliance.blockers(good_clip())), {"vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared", "overlays_third_parties_cleared"})
+        self.assertEqual(set(compliance.blockers(good_clip())), {"vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared",
+                                                                 "overlays_third_parties_cleared", "profanity_audio_reviewed"})
 
     def test_human_signoff_rules(self):
         c = good_clip(provenance={})
@@ -340,13 +354,15 @@ class GameAudioDefault(unittest.TestCase):
         self.assertIn("[0:a]volume=0.35[s]", render.audio_filter("mix", "1:a", None, game_volume=0.35))
 
     def test_gates_not_loosened_for_kept_audio(self):
-        kept = {"audio_mode": "mix", "mic_source": "stream:1", "mic_gain": 1.0, "music_volume": 1.0, "captions": "OFF",
-                "keep_game_audio_opt_in": True}
-        self.assertEqual(compliance.live_reaction_gate(good_clip(render=kept), {})[0], "PASS")
-        no_opt_in = {**kept, "keep_game_audio_opt_in": False}                      # phase 2.7: keeping game audio is opt-in
-        self.assertIn("--keep-game-audio", compliance.live_reaction_gate(good_clip(render=no_opt_in), {})[1])
-        with self.assertRaisesRegex(ValueError, "stripped by default"):
-            render.render("/nonexistent.mp4", 0, 20, "/tmp", "x.mp4", audio_mode="mix", mic_stream=1)
+        kept = {"audio_mode": "mix", "mic_source": "stream:1", "mic_gain": 1.0, "music_volume": 1.0, "captions": "OFF"}
+        self.assertEqual(compliance.live_reaction_gate(good_clip(render=kept), {})[0], "PASS")   # 2.8 override: no opt-in needed
+        self.assertEqual(compliance.live_reaction_gate(good_clip(render={**kept, "mic_gain": 0.5}), {})[0], "FAIL")
+        cmd = render.build_command("v.mkv", 0, 20, "o.mp4", audio_mode="mix", mic_stream=1, commentary="vo.wav")
+        g = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("[0:a:0]volume=1.0[s]", g)                                       # game audio kept, unchanged
+        self.assertIn("[0:a:1]volume=1.0[m]", g)                                       # mic at full level
+        self.assertIn("[1:a]volume=1.0[c]", g)                                         # voiceover on top
+        self.assertIn("amix=inputs=3:duration=first:normalize=0", g)                   # no ducking / normalisation
         self.assertEqual(compliance.live_reaction_gate(good_clip(render={**kept, "mic_source": None}), {})[0], "FAIL")
         self.assertEqual(compliance.music_hint(good_clip(render=kept), {})[0], "FAIL")  # fingerprint still required
         c = good_clip(render=kept, fingerprint_precheck={"status": "NOT_INSTALLED"})
@@ -429,6 +445,10 @@ class EndToEnd(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"CUTSCENECITY_REVIEW_KEY": KEY, **OWNER,
                                                 "CUTSCENECITY_STATE_DIR": str(self.d / "state"), "CUTSCENECITY_DAILY_CAP": "5"})
         self.env.start()
+        import edit
+        tw = mock.patch.object(edit, "transcribe_words", return_value=[])   # phase 2.8 audio scan: no speech unless a test says so
+        tw.start()
+        self.addCleanup(tw.stop)
 
     def tearDown(self):
         self.env.stop()
@@ -451,10 +471,20 @@ class EndToEnd(unittest.TestCase):
         details = self.d / "details.json"
         details.write_text(json.dumps({k: v for k, v in good_clip().items() if k in ("metadata", "transformation_note")}))
         self.rv("set", "--file", str(details), "--by", "Shebin")
+        self.rv("edit", "--style", "off", "--effects", "none", "--by", "Shebin", "--no-render")   # 2.8: choice -> mic scan at re-render
         voice = self.d / "voice.wav"
         ffmpeg("-f", "lavfi", "-i", "sine=frequency=200:duration=20", str(voice))
-        with self.assertRaises(SystemExit):  # no separate mic: fail closed
-            self.rv("commentary", "--audio", str(voice))
+        with self.assertRaisesRegex(SystemExit, "separate creator mic stem is required"):   # nothing at all: refused
+            self.rv("commentary")
+        with self.assertRaisesRegex(SystemExit, "--strip-game-audio needs"):
+            self.rv("commentary", "--audio", str(voice), "--strip-game-audio")
+        # 2.8 override: game audio + voiceover without a mic stem renders for review, but the gates fail closed
+        self.rv("commentary", "--audio", str(voice))
+        c = json.loads((self.root / "manifest.json").read_text())["clips"][0]
+        self.assertEqual((c["render"]["audio_mode"], c["render"]["mic_source"]), ("source", None))
+        for g in ("original_commentary", "live_reaction_preserved"):
+            self.assertEqual(c["compliance"][g]["status"], "FAIL", g)
+        self.assertIn("bypass was removed", c["compliance"]["original_commentary"]["evidence"])
         if tts:
             self.rv("commentary", "--audio", str(voice), "--mic-stream", "1", "--tts", "--voice-preset", "charon-relaxed")
             script = self.d / "script.txt"
@@ -469,8 +499,10 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("edge-density", scan["methods"])
         with self.assertRaises(SystemExit):
             self.rv("approve", "--by", "Shebin")
-        for check in ("vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared", "overlays_third_parties_cleared"):
-            self.rv("signoff", "--check", check, "--by", "Shebin", "--note", "watched the full clip twice, gameplay only")
+        for check in ("vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared", "overlays_third_parties_cleared",
+                      "profanity_audio_reviewed"):
+            self.rv("signoff", "--check", check, "--by", "Shebin", "--note", "watched the full clip twice, gameplay only",
+                    *(["--first-10s-full-mix-checked"] if check == "profanity_audio_reviewed" else []))
         with self.assertRaises(SystemExit) as cm:  # paid_promotion missing blocks
             self.rv("approve", "--by", "Shebin")
         self.assertIn("paid_promotion", str(cm.exception))
@@ -555,62 +587,44 @@ class EndToEnd(unittest.TestCase):
             self.rv("export", "--packages", str(self.d / "p3"))
         self.assertTrue(pkg_dir.exists())
 
-    def test_mixed_track_path_end_to_end(self):
-        os.environ["CUTSCENECITY_ALLOW_MIXED_TRACK"] = "true"   # opt-in (phase 2.7); restored by the setUp env patch
-        m = self.pipeline()
+    def test_no_mixed_track_bypass_and_game_audio_first_render(self):
+        os.environ["CUTSCENECITY_ALLOW_MIXED_TRACK"] = "true"   # phase 2.8: ignored (restored by the setUp env patch)
+        m = self.pipeline()                                      # no --mic/--mic-stream: source/game audio kept
         clip = m["clips"][0]
-        self.assertEqual(clip["technical_qa"]["status"], "PASS_TECHNICAL_ONLY")          # qa.py ran at --render
-        self.assertEqual(clip["compliance"]["technical_qa"]["status"], "PASS")
-        self.assertEqual(clip["metadata"]["description"],
-                         "From my Twitch stream: https://www.twitch.tv/cutscenecity \u2014 full VOD: https://www.twitch.tv/videos/1234567890")
-        self.assertEqual(clip["compliance"]["attribution"]["status"], "PASS")
-        self.assertEqual(clip["compliance"]["synthetic_disclosure"]["status"], "PASS")
-        self.assertIsInstance(clip["commentary"]["mixed_track_speech_share"], float)
+        self.assertEqual((clip["render"]["audio_mode"], clip["first_render_audio"]), ("source", "source"))
+        self.assertEqual(clip["render"]["game_audio"], "kept (default)")
+        self.assertTrue(render.has_audio(self.root / "short_01.mp4"))                  # game audio is in the render
         for g in ("original_commentary", "live_reaction_preserved"):
-            self.assertEqual(clip["compliance"][g]["status"], "WARN", clip["compliance"][g])
-        self.assertNotIn("paid_promotion", clip)                                          # suggestion only
+            self.assertEqual(clip["compliance"][g]["status"], "FAIL", clip["compliance"][g])
+        self.assertIn("bypass was removed", clip["compliance"]["original_commentary"]["evidence"])
+        self.assertNotIn("mixed_track_commentary_confirmed", clip["compliance"])
         import contextlib
         import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self.rv("status")
         st = json.loads(buf.getvalue())
-        self.assertIn("title", st["missing_creative_input"])
+        self.assertIn("--mic-stream N", st["how_to_fix"]["original_commentary"])
         self.assertIn("review.py paid --clip short_01.mp4 --value none", st["how_to_fix"]["paid_promotion_declared"])
-        self.assertIn("NOT DECLARED", st["paid_promotion"])
-        self.assertIn("mixed_track_commentary_confirmed", st["how_to_fix"])
-        details = self.d / "details.json"
-        md = dict(clip["metadata"], title="This getaway went sideways fast")
-        details.write_text(json.dumps({"metadata": md, "transformation_note": " ".join(["word"] * 30)}))
-        self.rv("set", "--file", str(details), "--by", "Shebin")
-        self.rv("precheck")
-        for check in ("vod_rights_confirmed", "no_story_cutscene", "music_risk_cleared", "overlays_third_parties_cleared"):
-            self.rv("signoff", "--check", check, "--by", "Shebin", "--note", "watched the full clip twice, gameplay only")
-        self.rv("paid", "--value", "none", "--by", "Shebin")
-        with self.assertRaises(SystemExit):   # mixed track not yet confirmed
-            self.rv("approve", "--by", "Shebin")
-        with self.assertRaises(SystemExit):   # note too short
-            self.rv("signoff", "--check", "mixed_track_commentary_confirmed", "--by", "Shebin", "--note", "audible")
-        self.rv("signoff", "--check", "mixed_track_commentary_confirmed", "--by", "Shebin", "--note", "my live commentary is clearly audible throughout")
-        self.rv("approve", "--by", "Shebin")
-        self.rv("export", "--packages", str(self.d / "packages"))
-        pkg_dir = next((self.d / "packages").iterdir())
-        self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
-        c2 = json.loads((pkg_dir / "clip.json").read_text())
-        self.assertEqual(c2["commentary"]["commentary_source"], "mixed_track_signed")
-        self.assertEqual(c2["compliance"]["original_commentary"]["status"], "PASS")
-        c2["commentary"]["commentary_source"] = None
-        (pkg_dir / "clip.json").write_text(json.dumps(c2))
-        self.assertTrue(any("commentary_source" in p for p in upload_private.verify_package(pkg_dir)[1]))
+        with self.assertRaises((SystemExit, ValueError)):                                # check no longer exists
+            self.rv("signoff", "--check", "mixed_track_commentary_confirmed", "--by", "Shebin Mathew", "--note", "my live commentary is audible")
+        # first render with the mic stem given: audio_mode mix (game audio kept + mic at 1.0), technical QA passes
+        m = self.pipeline("--mic-stream", "1")
+        clip = m["clips"][0]
+        self.assertEqual((clip["render"]["audio_mode"], clip["render"]["mic_source"]), ("mix", "stream:1"))
+        self.assertEqual((clip["render"]["game_audio"], clip["render"]["music_volume"]), ("kept (default)", 1.0))
+        self.assertEqual(clip["compliance"]["live_reaction_preserved"]["status"], "PASS")
+        self.assertEqual(clip["technical_qa"]["status"], "PASS_TECHNICAL_ONLY")
+        self.assertEqual(clip["compliance"]["original_commentary"]["status"], "FAIL")    # still needs the measured 60%
 
     def test_live_voice_only_no_tts_no_script(self):
         pkg_dir = self.approved_package(tts=False)
         self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
         clip = json.loads((pkg_dir / "clip.json").read_text())
         self.assertIs(clip["metadata"]["containsSyntheticMedia"], False)
-        self.assertEqual(clip["render"]["audio_mode"], "mic_stem")  # phase 2.7: game audio stripped by default
-        self.assertEqual((clip["render"]["game_audio"], clip["render"]["music_volume"]), ("stripped (default)", None))
-        self.assertIs(clip["render"]["keep_game_audio_opt_in"], False)
+        self.assertEqual(clip["render"]["audio_mode"], "mix")       # phase 2.8 override: game audio kept by default
+        self.assertEqual((clip["render"]["game_audio"], clip["render"]["music_volume"]), ("kept (default)", 1.0))
+        self.assertIs(clip["render"]["strip_game_audio_opt_in"], False)
 
 
     def test_paid_present_is_sent_true_and_tamper_blocks(self):
@@ -733,75 +747,48 @@ class OverlayScan(unittest.TestCase):
 
 
 def mixed_clip(**over):
-    c = good_clip(commentary={"mic_source": None, "tts_used": False, "mixed_track_speech_share": 0.71},
+    c = good_clip(commentary={"mic_source": None, "tts_used": False, "commentary_source": "mixed_track_signed"},
                   render={"audio_mode": "source", "mic_source": None, "music_volume": 1.0, "captions": "OFF"})
     c.update(over)
     return compliance.init_clip(c)
 
 
-class MixedTrack(unittest.TestCase):
-    def setUp(self):   # phase 2.7: the mixed-track path is opt-in; these tests cover it with the opt-in set
-        self.env = mock.patch.dict(os.environ, {**OWNER, "CUTSCENECITY_ALLOW_MIXED_TRACK": "true"})
+class MixedTrackRemoved(unittest.TestCase):
+    """Phase 2.8 (Compliance A): the mixed-track bypass is removed entirely; nothing restores a pass without the
+    60% mic measurement."""
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, OWNER)
         self.env.start()
+        self.addCleanup(self.env.stop)
 
-    def test_mixed_track_off_by_default(self):
-        with mock.patch.dict(os.environ, {"CUTSCENECITY_ALLOW_MIXED_TRACK": ""}):
-            c = mixed_clip()
-            compliance.evaluate(c, {"policy": json.loads((HERE / "editorial-policy.json").read_text())})
-            for g in ("original_commentary", "live_reaction_preserved"):
-                self.assertEqual(c["compliance"][g]["status"], "FAIL", g)
-                self.assertIn("separate mic track required", c["compliance"][g]["evidence"])
-            self.assertEqual(c["compliance"]["mixed_track_commentary_confirmed"]["hint"], "FAIL")
-            with self.assertRaises(PermissionError):
-                compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
-            self.assertTrue(compliance.mixed_track_allowed({"policy": {"mixed_track_path_enabled": True}}))
+    def test_env_and_policy_opt_ins_cannot_restore_a_pass(self):
+        pol = dict(json.loads((HERE / "editorial-policy.json").read_text()), mixed_track_path_enabled=True)
+        for env in ({}, {"CUTSCENECITY_ALLOW_MIXED_TRACK": "true"}):
+            with mock.patch.dict(os.environ, env):
+                c = mixed_clip(compliance={"mixed_track_commentary_confirmed": {"status": "PASS", "by": "Shebin Mathew",
+                                                                                 "note": "my commentary is audible over the game"}})
+                compliance.evaluate(c, {"policy": pol, "env": dict(os.environ)})
+                for g in ("original_commentary", "live_reaction_preserved"):
+                    self.assertEqual(c["compliance"][g]["status"], "FAIL", (env, g))
+                self.assertIn("bypass was removed", c["compliance"]["original_commentary"]["evidence"])
 
-    def tearDown(self):
-        self.env.stop()
-
-    def test_owner_mixed_track_warns_until_signed(self):
+    def test_check_and_helpers_are_gone(self):
+        self.assertNotIn("mixed_track_commentary_confirmed", compliance.CHECKS)
+        for name in ("mixed_track_allowed", "mixed_track_signed", "mixed_speech_share", "MIXED_ENV"):
+            self.assertFalse(hasattr(compliance, name), name)
         c = mixed_clip()
-        b = compliance.blockers(c)
-        self.assertEqual(c["compliance"]["original_commentary"]["status"], "WARN")
-        self.assertEqual(c["compliance"]["live_reaction_preserved"]["status"], "WARN")
-        self.assertIn("71%", c["compliance"]["original_commentary"]["evidence"])          # hint shown
-        self.assertIn("mixed_track_commentary_confirmed", b)
-        self.assertIn("mixed_track_commentary_confirmed", compliance.required_human_checks(c))
-        with self.assertRaises(PermissionError):
-            compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "fine")       # 5+ words
-        compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
-        compliance.evaluate(c)
-        self.assertEqual(c["compliance"]["original_commentary"]["status"], "PASS")
-        self.assertEqual(c["compliance"]["live_reaction_preserved"]["status"], "PASS")
-
-    def test_hint_alone_never_passes(self):
-        c = mixed_clip(commentary={"mic_source": None, "tts_used": False, "mixed_track_speech_share": 1.0})
-        compliance.evaluate(c)
-        self.assertEqual(c["compliance"]["original_commentary"]["status"], "WARN")
-
-    def test_non_owner_stays_rejected(self):
-        meta = {"vod_id": "1234567890", "uploader": "Other", "uploader_id": "otherstreamer"}
-        c = mixed_clip()
-        c["provenance"]["source_owner"] = meta
-        compliance.evaluate(c)
-        for g in ("original_commentary", "live_reaction_preserved", "creator_owned_source"):
-            self.assertEqual(c["compliance"][g]["status"], "FAIL", g)
-        with self.assertRaises(PermissionError):
-            compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
-
-    def test_mic_stem_preferred_and_mixed_check_not_applicable(self):
-        c = good_clip()
-        compliance.evaluate(c)
-        self.assertTrue(c["compliance"]["mixed_track_commentary_confirmed"]["not_applicable"])
-        self.assertNotIn("mixed_track_commentary_confirmed", compliance.required_human_checks(c))
         with self.assertRaises(ValueError):
-            compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin", "my commentary is audible over the game")
-        thin = good_clip(commentary={"mic_source": "stream:1", "speech_seconds_live": 3.0, "speech_seconds_combined": 3.0, "tts_used": False})
-        self.assertEqual(compliance.commentary_gate(thin, {})[0], "FAIL")                   # measured path stays strict
+            compliance.signoff(c, "mixed_track_commentary_confirmed", "Shebin Mathew", "my commentary is audible over the game")
+        self.assertNotIn("mixed_track_commentary_confirmed", compliance.required_human_checks(c))
+        pol = json.loads((HERE / "editorial-policy.json").read_text())
+        self.assertNotIn("mixed_track_path_enabled", pol)
+        self.assertNotIn("CUTSCENECITY_ALLOW_MIXED_TRACK=", (HERE.parents[1] / ".env.example").read_text())
 
-    def test_lowered_mixed_track_fails(self):
-        c = mixed_clip(render={"audio_mode": "source", "mic_source": None, "music_volume": 0.5, "captions": "OFF"})
-        self.assertEqual(compliance.live_reaction_gate(c, {})[0], "FAIL")
+    def test_measured_path_stays_strict(self):
+        thin = good_clip(commentary={"mic_source": "stream:1", "speech_seconds_live": 3.0, "speech_seconds_combined": 3.0, "tts_used": False})
+        self.assertEqual(compliance.commentary_gate(thin, {})[0], "FAIL")
+        self.assertEqual(compliance.commentary_gate(good_clip(), {})[0], "PASS")
+        self.assertEqual(compliance.live_reaction_gate(mixed_clip(), {})[0], "FAIL")
 
 
 class AutoDefaults(unittest.TestCase):
@@ -822,14 +809,18 @@ class AutoDefaults(unittest.TestCase):
                          "From my Twitch stream: https://www.twitch.tv/cutscenecity \u2014 full VOD: https://www.twitch.tv/videos/1")
         self.assertEqual(pipeline.credit_line({}, "https://www.twitch.tv/videos/1"), "")
 
-    def test_speech_hint_runs(self):
-        if not HAS_FFMPEG:
-            self.skipTest("ffmpeg")
-        with tempfile.TemporaryDirectory() as d:
-            f = pathlib.Path(d) / "a.wav"
-            ffmpeg("-f", "lavfi", "-i", "sine=frequency=1000:duration=4", "-af", "volume='if(lt(t,2),1,0)':eval=frame", str(f))
-            share = compliance.mixed_speech_share(f)
-        self.assertTrue(0.3 < share < 0.7, share)
+    def test_first_render_audio_keeps_game_audio(self):              # phase 2.8 (C, after Shebin's override)
+        import argparse
+        import pipeline
+        ns = lambda **kw: argparse.Namespace(**{"mic": None, "mic_stream": None, **kw})  # noqa: E731
+        self.assertEqual(pipeline.first_render_audio(ns(mic_stream=1)), {"audio_mode": "mix", "mic_stream": 1})
+        self.assertEqual(pipeline.first_render_audio(ns(mic="m.wav")), {"audio_mode": "mix", "mic": "m.wav"})
+        self.assertEqual(pipeline.first_render_audio(ns()), {"audio_mode": "source"})
+        cmd = render.build_command("v.mp4", 0, 20, "o.mp4", audio_mode="none")
+        self.assertIn("-an", cmd)
+        self.assertNotIn("0:a", " ".join(cmd))                                       # no VOD audio at all
+        with self.assertRaises(ValueError):
+            render.build_command("v.mp4", 0, 20, "o.mp4", audio_mode="mic_stem")       # mic_stem without a mic: fail closed
 
 
 class Upscale(unittest.TestCase):
@@ -875,16 +866,19 @@ class Defaults(unittest.TestCase):
     def test_policy_defaults(self):
         pol = json.loads((HERE / "editorial-policy.json").read_text())
         self.assertEqual(pol["daily_upload_cap"], 1)
-        self.assertEqual(pol["game_audio_default"], "stripped")
-        self.assertIs(pol["mixed_track_path_enabled"], False)
+        self.assertEqual(pol["game_audio_default"], "kept")                 # phase 2.8 override (Shebin)
+        self.assertNotIn("mixed_track_path_enabled", pol)                   # phase 2.8: bypass removed
         self.assertEqual(pol["edit_policy"]["default_edit_style"], "clean")
         self.assertEqual(pol["default_layout"], "blur")
         self.assertEqual(pol["source_policy"], "creator_owned_only")
         self.assertNotIn("source_vod", pol)
 
-    def test_no_default_vod_anywhere(self):
-        for path in [HERE.parents[1] / ".github/workflows/twitch-vod-shorts.yml", *HERE.glob("*.py"), *HERE.glob("*.md"), *HERE.glob("*.json")]:
-            self.assertNotIn("29365" + "44559", path.read_text(), str(path))
+    def test_no_default_vod_anywhere(self):          # phase 2.8: real VOD ids scrubbed from code, README and docs/
+        docs = HERE.parents[1] / "docs" / "cutscenecity"
+        for path in [HERE.parents[1] / ".github/workflows/twitch-vod-shorts.yml", *HERE.glob("*.py"), *HERE.glob("*.md"),
+                     *HERE.glob("*.json"), *docs.rglob("*.md")]:
+            for vod in ("29365" + "44559", "29375" + "78726"):
+                self.assertNotIn(vod, path.read_text(), str(path))
 
     def test_pipeline_requires_explicit_source_and_defaults_to_blur(self):
         p = subprocess.run([sys.executable, str(HERE / "pipeline.py"), "--output", tempfile.mkdtemp()], capture_output=True, text=True)
@@ -907,6 +901,8 @@ class Workflow(unittest.TestCase):
     def test_ci_never_uploads(self):
         text = (HERE.parents[1] / ".github/workflows/twitch-vod-shorts.yml").read_text()
         for banned in ("upload_private", "review.py approve", "YOUTUBE", "CLIENT_SECRET", "REVIEW_KEY", "youtube.upload"):
+            self.assertNotIn(banned, text)
+        for banned in ("upload-artifact", "short_*.mp4", "output/manifest.json"):   # phase 2.8 (B): no rendered media artifacts
             self.assertNotIn(banned, text)
 
 
@@ -996,8 +992,8 @@ class EditStage(unittest.TestCase):
             with mock.patch.object(edit, "transcribe_words", return_value=WORDS) as tw:
                 hype = render.render(vod, 28, 48, d, "hype.mp4", layout="blur", audio_mode="mix", mic_stream=1, keep_game_audio=True,
                                      edit_choice=choice, upscale="1440")
-            self.assertEqual(tw.call_args.kwargs["stream"], "0:a:1")                    # captions from the MIC stem only
-            self.assertEqual(tw.call_args.kwargs["start"], 28)
+            self.assertEqual(tw.call_args_list[0].kwargs["stream"], "0:a:1")  # captions from the MIC stem only
+            self.assertEqual(tw.call_args_list[0].kwargs["start"], 28)                # mic stem (captions); [1] = full mix
             plain = render.render(vod, 28, 48, d, "plain.mp4", layout="blur", audio_mode="mix", mic_stream=1, keep_game_audio=True,
                                   upscale="1440")
             self.assertEqual(audio_md5(d / "hype.mp4"), audio_md5(d / "plain.mp4"))     # edit + upscale never touch audio
@@ -1050,7 +1046,7 @@ class Phase27Compliance(unittest.TestCase):
 
     def test_fix3_captions_reviewed_required_and_bound_to_words_json(self):
         burned = {"audio_mode": "mic_stem", "mic_source": "stream:1", "mic_gain": 1.0, "captions": "BURNED_WORD_BY_WORD_NEEDS_HUMAN_CHECK",
-                  "caption_source": "mic_stream:1", "caption_style": "word-pop-yellow"}
+                  "caption_source": "mic_stream:1", "caption_style": "word-pop-yellow", "profanity_audio": _clean_audio()}
         self.assertNotIn("captions_reviewed", compliance.required_human_checks(good_clip()))
         c = good_clip(render=dict(burned))
         self.assertIn("captions_reviewed", compliance.required_human_checks(c))
@@ -1063,8 +1059,8 @@ class Phase27Compliance(unittest.TestCase):
             self.assertIn("captions_reviewed: no signed caption review", " ".join(edit_gates.signed_problems(c, [], "f" * 64, wp)))
             so = {"action": "signoff", "check": "captions_reviewed", "clip": "short_01.mp4", "file_sha256": "f" * 64,
                   "words_json_sha256": sha, "note": "read every caption word against the video"}
-            self.assertEqual(edit_gates.signed_problems(c, [so], "f" * 64, wp), [])
-            self.assertTrue(edit_gates.signed_problems(c, [so], "e" * 64, wp))         # other file
+            self.assertEqual(edit_gates.signed_problems(c, [so, _pa_signoff()], "f" * 64, wp), [])
+            self.assertTrue(edit_gates.signed_problems(c, [so, _pa_signoff()], "e" * 64, wp))         # other file
             wp.write_text(json.dumps([{"word": "Lucia", "start": 12.0, "end": 12.3}]))
             probs = " ".join(edit_gates.signed_problems(c, [so], "f" * 64, wp))
             self.assertIn("words.json changed after render", probs)
@@ -1092,8 +1088,8 @@ class Phase27Compliance(unittest.TestCase):
                               "words_json_sha256": "a" * 64, "caption_review": flags})
         self.assertEqual(compliance.captions_hint(c, {})[0], "WARN")                    # note required
         pol = json.loads((HERE / "editorial-policy.json").read_text())
-        self.assertIs(pol["caption_policy"]["audio_bleep"], False)
-        self.assertIn("NOT bleeped", pol["caption_policy"]["audio_bleep_note"])
+        self.assertEqual(pol["caption_policy"]["audio_bleep"], "per_clip_choice")       # phase 2.8: optional bleep
+        self.assertIn("--bleep tone", pol["caption_policy"]["audio_bleep_note"])
 
     def test_fix5_story_names_and_plot_keywords_flagged(self):
         pol = json.loads((HERE / "editorial-policy.json").read_text())
@@ -1171,7 +1167,7 @@ class Phase27Compliance(unittest.TestCase):
         self.assertIn("review.py edit", pipeline.pre_edit_refusal(args))
         self.assertIsNone(pipeline.pre_edit_refusal(mock.Mock(captions=False, edit_style=None, caption_style=None, flash_cut=False)))
         c = good_clip(render={"audio_mode": "mic_stem", "mic_source": "stream:1", "mic_gain": 1.0, "captions": "OFF",
-                              "edit_style": "hype", "edit_effects": ["punch_in"]})
+                              "edit_style": "hype", "edit_effects": ["punch_in"], "profanity_audio": _clean_audio()})
         pol = json.loads((HERE / "editorial-policy.json").read_text())
         self.assertIn("without a recorded human edit choice", compliance.rotation_gate(c, {"policy": pol})[1])
         c["edit_choice"] = {"edit_style": "hype", "effects": ["punch_in", "shake"], "by": "Shebin", "flash_intensity_pct": 0}
@@ -1181,7 +1177,7 @@ class Phase27Compliance(unittest.TestCase):
         self.assertIn("no signed per-clip human edit choice", " ".join(edit_gates.signed_problems(c, [], "f" * 64, None)))
         e = {"action": "edit_choice", "clip": "short_01.mp4", "edit_style": "hype", "effects": ["punch_in"], "by": "Shebin",
              "flash_intensity_pct": 0}
-        self.assertEqual(edit_gates.signed_problems(c, [e], "f" * 64, None), [])
+        self.assertEqual(edit_gates.signed_problems(c, [e, _pa_signoff()], "f" * 64, None), [])
 
     def test_fix8_flash_off_by_default_max_one_and_half_intensity(self):
         self.assertEqual((edit_gates.FLASH_MAX_PER_CLIP, edit_gates.FLASH_MAX_INTENSITY), (1, 0.5))
@@ -1226,19 +1222,37 @@ class Phase27EndToEnd(unittest.TestCase):
             self.rv("edit", "--style", "clean", "--effects", "captions", "--by", "Shebin")
         self.rv("commentary", "--mic-stream", "1")
         c0 = json.loads((self.root / "manifest.json").read_text())["clips"][0]
-        self.assertEqual(c0["render"]["audio_mode"], "mic_stem")                    # game audio stripped by default
+        self.assertEqual(c0["render"]["audio_mode"], "mix")                         # game audio kept by default (2.8 override)
         with self.assertRaisesRegex(SystemExit, "--by is required"):
             self.rv("edit", "--style", "hype", "--effects", "punch_in")
         with self.assertRaisesRegex(SystemExit, "flash intensity"):
             self.rv("edit", "--style", "hype", "--effects", "flash_cut", "--flash-intensity", "0.8", "--by", "Shebin")
         with mock.patch.object(edit, "transcribe_words", return_value=words) as tw:
             self.rv("edit", "--by", "Shebin")                                       # default choice: clean + captions
-        self.assertEqual(tw.call_args.kwargs["stream"], "0:a:1")
+        self.assertEqual(tw.call_args_list[0].kwargs["stream"], "0:a:1")             # captions: mic stem only
         c = json.loads((self.root / "manifest.json").read_text())["clips"][0]
         self.assertEqual((c["render"]["edit_style"], c["render"]["edit_effects"], c["edit_choice"]["by"]), ("clean", ["captions"], "Shebin"))
         wj = json.loads((self.root / c["render"]["words_json"]).read_text())
         self.assertEqual([w["word"] for w in wj], ["oh", "s***", "he", "is", "flanking", "left"])
         self.assertEqual(c["render"]["caption_review"]["profanity_first_10s"], [2.5])
+        # phase 2.8 (D): the same mic transcript is scanned for audio profanity; unbleeped in the first 10 s blocks
+        pa = c["render"]["profanity_audio"]
+        self.assertEqual((pa["hits"], pa["bleep"], pa["unbleeped_first_10s_ms"]), ([{"word": "s***", "start_ms": 2500, "end_ms": 2900}], "off", [2500]))
+        self.assertEqual(tw.call_count, 2)                                          # 2.8.1: mic (captions reused) + full mix
+        self.assertEqual(tw.call_args_list[1].kwargs["stream"], "0:a:0")            # the full final mix
+        self.assertEqual(pa["mix_status"], "SCANNED")
+        self.assertEqual(c["compliance"]["profanity_audio_reviewed"]["hint"], "FAIL")
+        with self.assertRaisesRegex(SystemExit, "first 10 s is not bleeped"):
+            self.rv("signoff", "--check", "profanity_audio_reviewed", "--by", "Shebin", "--note", "heard it, it is fine really")
+        unbleeped = audio_md5(self.root / "short_01.mp4")
+        with mock.patch.object(edit, "transcribe_words", return_value=words):
+            self.rv("edit", "--by", "Shebin", "--bleep", "tone")                     # human choice: 1 kHz tone over the word
+        c = json.loads((self.root / "manifest.json").read_text())["clips"][0]
+        pa = c["render"]["profanity_audio"]
+        self.assertEqual((pa["bleep"], pa["bleeped_segments"], pa["unbleeped_ms"]), ("tone", [[2450, 2950]], []))
+        self.assertEqual(c["edit_choice"]["bleep"], "tone")
+        self.assertNotEqual(audio_md5(self.root / "short_01.mp4"), unbleeped)        # audio re-encoded with the bleep
+        self.assertEqual(c["compliance"]["profanity_audio_reviewed"]["hint"], "WARN")
         self.rv("precheck")
         c = json.loads((self.root / "manifest.json").read_text())["clips"][0]
         self.assertEqual(c["overlay_scan"]["scanned"], "pre_edit")
@@ -1251,10 +1265,269 @@ class Phase27EndToEnd(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, r"5\+ words"):                        # flagged: profanity in the first 10 s
             self.rv("signoff", "--check", "captions_reviewed", "--by", "Shebin", "--note", "fine")
         self.rv("signoff", "--check", "captions_reviewed", "--by", "Shebin", "--note", "read all captions; masked swear is ok")
+        with self.assertRaisesRegex(SystemExit, "profanity_audio_reviewed"):
+            self.rv("approve", "--by", "Shebin")
+        with self.assertRaisesRegex(SystemExit, "5\\+ words"):
+            self.rv("signoff", "--check", "profanity_audio_reviewed", "--by", "Shebin", "--note", "ok", "--first-10s-full-mix-checked")
+        with self.assertRaisesRegex(SystemExit, "first-10s-full-mix-checked"):
+            self.rv("signoff", "--check", "profanity_audio_reviewed", "--by", "Shebin", "--note", "listened twice, the swear is fully bleeped")
+        self.rv("signoff", "--check", "profanity_audio_reviewed", "--by", "Shebin", "--note", "listened twice, the swear is fully bleeped",
+                "--first-10s-full-mix-checked")
         self.rv("approve", "--by", "Shebin")
         self.rv("export", "--packages", str(self.d / "packages"))
         pkg_dir = next((self.d / "packages").iterdir())
         self.assertTrue((pkg_dir / "captions.words.json").exists())
+        log = [json.loads(l) for l in (pkg_dir / "review_log.jsonl").read_text().splitlines()]
+        so = [e for e in log if e.get("check") == "profanity_audio_reviewed"][-1]
+        self.assertEqual(so["final_sha256"], gatelog.sha256_file(pkg_dir / "video.mp4"))   # pinned to the final file
         self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
         (pkg_dir / "captions.words.json").write_text(json.dumps(wj[:3]))
         self.assertTrue(any("words.json" in p for p in upload_private.verify_package(pkg_dir)[1]))
+
+
+def max_volume(path, start, dur):
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-ss", str(start), "-t", str(dur), "-i", str(path), "-map", "0:a",
+                        "-af", "volumedetect", "-f", "null", "-"], capture_output=True, text=True)
+    import re
+    return float(re.search(r"max_volume: (-?[\d.]+|-inf) dB", p.stderr).group(1).replace("-inf", "-999"))
+
+
+class Phase28Compliance(unittest.TestCase):
+    """Phase 2.8 (Compliance conditional pass): mixed-track bypass removed (A, MixedTrackRemoved), first render
+    mic_stem (C, AutoDefaults), audio-profanity gate (D), music wording (E)."""
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, OWNER)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_d_audio_scan_record_and_first_10s_block(self):
+        words = [{"word": "Fucking", "start": 1.2, "end": 1.6}, {"word": "nice", "start": 2.0, "end": 2.3},
+                 {"word": "shit", "start": 14.0, "end": 14.3}]
+        rec = edit_gates.audio_profanity_record(words, "off", "mic_stream:1", mix_words=[])
+        self.assertEqual([h["word"] for h in rec["hits"]], ["F******", "s***"])     # raw words never stored
+        self.assertNotIn("Fucking", json.dumps(rec))
+        self.assertEqual(rec["unbleeped_first_10s_ms"], [1200])
+        self.assertTrue(all(isinstance(v, int) for h in rec["hits"] for v in (h["start_ms"], h["end_ms"])))  # ints: signable
+        c = good_clip(render={**good_clip()["render"], "profanity_audio": rec})
+        self.assertEqual(compliance.profanity_audio_hint(c, {})[0], "FAIL")
+        with self.assertRaises(PermissionError):
+            compliance.signoff(c, "profanity_audio_reviewed", "Shebin Mathew", "heard it all, it is acceptable here")
+        late = edit_gates.audio_profanity_record(words[1:], "off", "mic_stream:1", mix_words=[])   # only after 10 s: warn + note
+        c = good_clip(render={**good_clip()["render"], "profanity_audio": late})
+        self.assertEqual(compliance.profanity_audio_hint(c, {})[0], "WARN")
+        with self.assertRaises(PermissionError):
+            compliance.signoff(c, "profanity_audio_reviewed", "Shebin Mathew", "ok")
+        compliance.signoff(c, "profanity_audio_reviewed", "Shebin Mathew", "one swear at 14 s, acceptable for the channel")
+        for mode in ("tone", "mute"):
+            b = edit_gates.audio_profanity_record(words, mode, "mic_stream:1", mix_words=[])
+            self.assertEqual(b["bleeped_segments"], [[1150, 1650], [13950, 14350]])
+            self.assertEqual((b["unbleeped_ms"], b["unbleeped_first_10s_ms"]), ([], []))
+            self.assertEqual(edit_gates.audio_profanity_problems(b, {"bleep": mode}), [])
+            self.assertIn("differs from the recorded human edit choice", " ".join(edit_gates.audio_profanity_problems(b, {"bleep": "off"})))
+        tampered = dict(edit_gates.audio_profanity_record(words, "tone", "mic_stream:1", mix_words=[]), bleeped_segments=[[13950, 14350]])
+        self.assertIn("not bleeped", " ".join(edit_gates.audio_profanity_problems(tampered)))          # state is recomputed
+        self.assertIn("not scanned", " ".join(edit_gates.audio_profanity_problems(None)))
+        na = edit_gates.audio_profanity_record([], "off", "mic_stream:1", "UNAVAILABLE_NO_FASTER_WHISPER", mix_words=[])
+        self.assertIn("failing closed", " ".join(edit_gates.audio_profanity_problems(na)))
+        with self.assertRaises(ValueError):
+            edit_gates.validate_choice({"edit_style": "off", "effects": [], "by": "Shebin", "bleep": "loud"})
+        self.assertEqual(edit_gates.validate_choice({"edit_style": "off", "effects": [], "by": "Shebin"})["bleep"], "off")
+
+    def test_d_signed_review_pinned_to_final_file_and_scan(self):
+        rec = edit_gates.audio_profanity_record([{"word": "shit", "start": 14.0, "end": 14.3}], "off", "mic_stream:1", mix_words=[])
+        c = good_clip(render={**good_clip()["render"], "profanity_audio": rec})
+        base = {"action": "signoff", "check": "profanity_audio_reviewed", "clip": c["file"], "file_sha256": "f" * 64,
+                "final_sha256": "f" * 64, "profanity_audio_sha256": edit_gates.sha256_record(rec),
+                "note": "one swear at 14 s, acceptable", "first_10s_full_mix_checked": True}
+        ok = edit_gates.signed_problems(c, [base], "f" * 64, None)
+        self.assertEqual([p for p in ok if "profanity" in p], [])
+        for bad in ({"final_sha256": "0" * 64}, {"profanity_audio_sha256": "0" * 64}, {"note": "ok"},
+                    {"first_10s_full_mix_checked": False}):
+            probs = " ".join(edit_gates.signed_problems(c, [{**base, **bad}], "f" * 64, None))
+            self.assertIn("profanity_audio_reviewed", probs, bad)
+        self.assertIn("profanity_audio_reviewed", " ".join(edit_gates.signed_problems(c, [base], "e" * 64, None)))  # new file
+        self.assertIn("profanity_audio_reviewed", compliance.required_human_checks(good_clip()))
+
+    def test_d_title_and_thumbnail_text_clean(self):
+        c = good_clip()
+        self.assertEqual(compliance.title_thumbnail_gate(c, {})[0], "PASS")
+        c["metadata"]["title"] = "What the F*ck... no: what the FUCK"
+        self.assertEqual(compliance.title_thumbnail_gate(c, {})[0], "FAIL")
+        self.assertNotIn("FUCK", compliance.title_thumbnail_gate(c, {})[1])            # evidence masked
+        c = good_clip()
+        c["metadata"]["thumbnail_text"] = "BULLSHIT_MOVE"
+        self.assertEqual(compliance.title_thumbnail_gate(c, {})[0], "PASS")             # prefix match per token (documented)
+        c["metadata"]["thumbnail_text"] = "shitshow at the docks"
+        self.assertEqual(compliance.title_thumbnail_gate(c, {})[0], "FAIL")
+        self.assertIn("title_thumbnail_profanity_free", compliance.blockers(c))
+
+    def test_d_bleep_filter_shapes(self):
+        f = edit.bleep_filter([[1000, 1500]], "mute", 20)
+        self.assertEqual(f, "[0:a]volume=0:enable='between(t,1.000,1.500)'[a]")
+        t = edit.bleep_filter([[1000, 1500], [3000, 3400]], "tone", 20)
+        self.assertIn("sin(2*PI*1000*t)", t)
+        self.assertIn("between(t,3.000,3.400)", t)
+        with self.assertRaises(ValueError):
+            edit.bleep_filter([], "tone", 20)
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
+    def test_d_bleep_real_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            for mode in ("mute", "tone"):
+                f = pathlib.Path(d) / f"{mode}.mp4"
+                ffmpeg("-f", "lavfi", "-i", "testsrc2=s=1080x1920:r=30:d=16", "-f", "lavfi", "-i", "sine=frequency=300:duration=16",
+                       "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(f))
+                vbefore = subprocess.run(["ffmpeg", "-v", "error", "-i", str(f), "-map", "0:v", "-c", "copy", "-f", "md5", "-"],
+                                         capture_output=True, text=True).stdout
+                edit.apply_bleep(f, [[4000, 6000]], mode)
+                vafter = subprocess.run(["ffmpeg", "-v", "error", "-i", str(f), "-map", "0:v", "-c", "copy", "-f", "md5", "-"],
+                                        capture_output=True, text=True).stdout
+                self.assertEqual(vbefore, vafter)                                      # video stream copied
+                outside = max_volume(f, 9, 2)
+                inside = max_volume(f, 4.4, 1.2)
+                self.assertGreater(outside, -30)
+                if mode == "mute":
+                    self.assertLess(inside, -60, inside)
+                else:
+                    self.assertGreater(inside, -30, inside)                            # the tone replaces the voice
+                    import numpy as np
+                    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", "4.4", "-t", "1", "-i", str(f), "-ac", "1", "-ar", "8000",
+                                          "-f", "f32le", "-"], capture_output=True, check=True).stdout
+                    spec = np.abs(np.fft.rfft(np.frombuffer(raw, dtype="<f4")))
+                    self.assertAlmostEqual(np.argmax(spec) * 8000 / (len(spec) * 2 - 2), 1000, delta=15)
+                self.assertEqual(qa.validate(f, 0, 16)["status"], "PASS_TECHNICAL_ONLY")
+
+    def test_e_music_wording_reflects_kept_default(self):
+        desc = compliance.CHECKS["music_risk_cleared"]["description"]
+        self.assertIn("KEPT by default", desc)
+        self.assertNotIn("STRIPPED by default", desc)
+        fp = {"status": "NO_MATCH_DB"}
+        kept = good_clip(fingerprint_precheck=fp, render={"audio_mode": "mix", "mic_source": "stream:1", "music_volume": 1.0})
+        st, ev = compliance.music_hint(kept, {})
+        self.assertEqual(st, "WARN")                                                    # note + whole-clip listen required
+        self.assertIn("game audio KEPT (default", ev)
+        self.assertIn("--strip-game-audio", ev)
+        stripped = good_clip(fingerprint_precheck=fp, render={"audio_mode": "mic_stem", "mic_source": "stream:1"})
+        self.assertIn("--strip-game-audio opt-in", compliance.music_hint(stripped, {})[1])
+        silent = good_clip(fingerprint_precheck=fp, render={"audio_mode": "none"})
+        self.assertEqual(compliance.music_hint(silent, {})[0], "FAIL")
+        gates = (HERE.parents[1] / "docs" / "cutscenecity" / "GATES.md").read_text()
+        self.assertIn("KEPT by default", gates)
+        self.assertNotIn("STRIPPED by default", gates)
+
+
+class Phase281Compliance(unittest.TestCase):
+    """Phase 2.8.1: live-voice floor (mic stem only), independent music note, full-mix profanity coverage."""
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, OWNER)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def _comm(self, live, combined, mic="stream:1"):
+        return good_clip(commentary={"mic_source": mic, "speech_seconds_live": live, "speech_seconds_combined": combined,
+                                     "tts_used": True, "voice_preset": "charon-relaxed", "path": "/tmp/v.wav"},
+                         metadata={**good_clip()["metadata"], "containsSyntheticMedia": True})
+
+    def test_live_voice_floor_mic_stem_only(self):
+        runtime = 20.0
+        c = self._comm(0.20 * runtime, 0.70 * runtime)                        # 20% mic + 50% TTS = 70% total
+        st, ev = compliance.commentary_gate(c, {})
+        self.assertEqual(st, "FAIL")
+        self.assertIn("creator live voice (mic stem only) covers 20%", ev)
+        c = self._comm(0.35 * runtime, 0.65 * runtime)                        # 35% mic + 30% TTS = 65% total
+        self.assertEqual(compliance.commentary_gate(c, {}), ("PASS", "live voice + TTS covers 65% of runtime (live voice alone 35%)"))
+        c = self._comm(0.35 * runtime, 0.50 * runtime)                        # floor met but total < 60%
+        self.assertIn("60% required", compliance.commentary_gate(c, {})[1])
+        c = self._comm(0.0, runtime, mic=None)                                # mix + TTS, no mic: hard FAIL
+        self.assertEqual(compliance.commentary_gate(c, {})[0], "FAIL")
+        self.assertIn("bypass was removed", compliance.commentary_gate(c, {})[1])
+        self.assertEqual(compliance.live_voice_coverage(c), 0.0)
+        pol = json.loads((HERE / "editorial-policy.json").read_text())
+        self.assertEqual(pol["min_live_voice_coverage"], 0.3)
+        ctx = compliance.build_ctx({**pol, "min_live_voice_coverage": 0.1}, HERE)  # policy can only raise the floor
+        self.assertEqual(ctx["min_live_voice"], 0.30)
+        self.assertEqual(compliance.commentary_gate(self._comm(5.0, 14.0), ctx)[0], "FAIL")   # 25% mic
+
+    def test_music_note_independent_check(self):
+        e = {"action": "signoff", "check": "music_risk_cleared", "clip": "short_01.mp4", "file_sha256": "f" * 64,
+             "note": "listened to the whole clip, no radio"}
+        for mode in ("mix", "source"):
+            c = good_clip(render={**good_clip()["render"], "audio_mode": mode})
+            self.assertIsNone(compliance.music_note_problem(c, [e], "f" * 64))
+            self.assertIn("5+ words", compliance.music_note_problem(c, [{**e, "note": "ok fine"}], "f" * 64))
+            self.assertIn("5+ words", compliance.music_note_problem(c, [], "f" * 64))
+            self.assertIn("5+ words", compliance.music_note_problem(c, [e], "e" * 64))      # other file
+        c = good_clip(render={**good_clip()["render"], "audio_mode": "mic_stem"})
+        self.assertIsNone(compliance.music_note_problem(c, [], "f" * 64))                 # game audio stripped
+
+    def test_full_mix_scan_record_and_confirmation(self):
+        mic = [{"word": "nice", "start": 1.0, "end": 1.3}]
+        mix = [{"word": "fuck", "start": 4.0, "end": 4.4}]                    # game dialogue, not in the mic stem
+        rec = edit_gates.audio_profanity_record(mic, "off", "mic_stream:1", mix_words=mix)
+        self.assertEqual((rec["hits"], rec["mix_hits"]), ([], [{"word": "f***", "start_ms": 4000, "end_ms": 4400}]))
+        self.assertEqual(rec["unbleeped_first_10s_ms"], [4000])
+        self.assertIn("first 10 s is not bleeped", " ".join(edit_gates.audio_profanity_problems(rec)))
+        b = edit_gates.audio_profanity_record(mic, "mute", "mic_stream:1", mix_words=mix)
+        self.assertEqual(b["bleeped_segments"], [[3950, 4450]])
+        self.assertEqual(edit_gates.audio_profanity_problems(b, {"bleep": "mute"}), [])
+        ns = edit_gates.audio_profanity_record(mic, "off", "mic_stream:1")   # full mix never scanned: fail closed
+        self.assertEqual(ns["mix_status"], "NOT_SCANNED")
+        self.assertIn("full-mix scan NOT_SCANNED", " ".join(edit_gates.audio_profanity_problems(ns)))
+        both = edit_gates.audio_profanity_record([{"word": "shit", "start": 14.0, "end": 14.3}], "tone", "mic_stream:1",
+                                                 mix_words=[{"word": "shit", "start": 14.0, "end": 14.3}])
+        self.assertEqual(both["bleeped_segments"], [[13950, 14350]])                       # same word in mic + mix: merged
+        self.assertEqual(both["unbleeped_ms"], [])
+        c = good_clip(render={**good_clip()["render"], "profanity_audio": _clean_audio()})
+        so = _pa_signoff()
+        self.assertEqual([p for p in edit_gates.signed_problems(c, [so], "f" * 64, None) if "profanity" in p], [])
+        so.pop("first_10s_full_mix_checked")
+        self.assertIn("first 10 s of the FULL mix", " ".join(edit_gates.signed_problems(c, [so], "f" * 64, None)))
+
+    @unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
+    def test_full_mix_transcribed_and_bleeped(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "final.mp4"
+            ffmpeg("-f", "lavfi", "-i", "testsrc2=s=1080x1920:r=30:d=12", "-f", "lavfi", "-i", "sine=frequency=300:duration=12",
+                   "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(f))
+            calls = []
+
+            def fake(media, model=None, start=None, duration=None, stream="0:a:0"):
+                calls.append((pathlib.Path(media).name, stream))
+                return [{"word": "fucking", "start": 3.0, "end": 3.5}] if pathlib.Path(media) == f else []
+            src = {"media": str(pathlib.Path(d) / "vod.mkv"), "stream": "0:a:1", "label": "mic_stream:1", "start": 0}
+            with mock.patch.object(edit, "transcribe_words", side_effect=fake):
+                rec = edit.audio_profanity(f, {"bleep": "mute"}, src, words=[])
+            self.assertEqual(calls, [("final.mp4", "0:a:0")])                    # mic words reused; full mix transcribed
+            self.assertEqual((rec["mix_status"], rec["bleeped_segments"]), ("SCANNED", [[2950, 3550]]))
+            self.assertLess(max_volume(f, 3.05, 0.4), -60)
+            with mock.patch.object(edit, "transcribe_words", return_value=None):
+                na = edit.audio_profanity(f, {"bleep": "off"}, src)
+            self.assertEqual((na["status"], na["mix_status"]), ("UNAVAILABLE_NO_FASTER_WHISPER", "UNAVAILABLE_NO_FASTER_WHISPER"))
+
+
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg required")
+class Phase281VerifyPackage(unittest.TestCase):
+    """verify_package enforces the live-voice floor and the music note on its own (not via Python's hints)."""
+    setUpClass, tearDownClass = EndToEnd.__dict__["setUpClass"], EndToEnd.__dict__["tearDownClass"]
+    setUp, tearDown, pipeline, rv, approved_package = (EndToEnd.setUp, EndToEnd.tearDown, EndToEnd.pipeline, EndToEnd.rv,
+                                                       EndToEnd.approved_package)
+
+    def test_verify_package_floor_and_music_note(self):
+        pkg_dir = self.approved_package()
+        self.assertEqual(upload_private.verify_package(pkg_dir)[1], [])
+        clip = json.loads((pkg_dir / "clip.json").read_text())
+        pkg = json.loads((pkg_dir / "package.json").read_text())
+        clip["commentary"]["speech_seconds_live"] = 0.2 * (clip["end"] - clip["start"])
+        (pkg_dir / "clip.json").write_text(json.dumps(clip))
+        self.assertTrue(any(p.startswith("creator live voice (mic stem only) covers 20%") for p in upload_private.verify_package(pkg_dir)[1]))
+        clip = json.loads((pkg_dir / "clip.json").read_text())
+        clip["commentary"]["speech_seconds_live"] = 0.5 * (clip["end"] - clip["start"])
+        clip["render"]["audio_mode"] = "mix"
+        (pkg_dir / "clip.json").write_text(json.dumps(clip))
+        self.assertFalse(any(p.startswith("music_risk_cleared: game/source") for p in upload_private.verify_package(pkg_dir)[1]))
+        gatelog.append_review(pkg_dir / "review_log.jsonl", action="signoff", check="music_risk_cleared", clip=pkg["clip"],
+                              file_sha256=pkg["file_sha256"], by="Shebin", note="fine")   # latest sign-off, short note
+        self.assertTrue(any(p.startswith("music_risk_cleared: game/source") for p in upload_private.verify_package(pkg_dir)[1]))
+
