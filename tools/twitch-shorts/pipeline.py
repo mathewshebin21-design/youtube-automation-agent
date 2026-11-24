@@ -67,6 +67,32 @@ def layout_profile(name):
     return profiles[name]
 
 
+def manual_windows(specs, duration):
+    rows = []
+    for spec in specs:
+        s, e = (float(x) for x in str(spec).split("-", 1))
+        if not (0 <= s < e <= duration + 0.01 and 15 <= e - s <= 60):
+            raise ValueError(f"--window {spec}: must be inside the input and 15-60 s long")
+        rows.append({"start": s, "end": e, "raw": {"motion_p75": 0.0}, "combined_score": None, "signal_ranks": {},
+                     "signals_used": ["manual window"],
+                     "selection_note": f"Manual window {s:g}-{e:g}s. A human must confirm setup, payoff and that this is not a story cutscene."})
+    return rows
+
+
+def join_adjacent(rows, max_len=60.0):
+    """Merge picks that touch end-to-start into one clip (<= max_len s); records the join offset for --flash-cut."""
+    out = []
+    for r in sorted(rows, key=lambda r: r["start"]):
+        prev = out[-1] if out else None
+        if prev and abs(prev["end"] - r["start"]) < 0.01 and r["end"] - prev["start"] <= max_len:
+            prev["joins"] = prev.get("joins", []) + [prev["end"] - prev["start"]]
+            prev["end"] = r["end"]
+            prev["selection_note"] += " Joined with the adjacent pick: " + r["selection_note"]
+        else:
+            out.append(dict(r))
+    return out
+
+
 def credit_line(owner, vod_url):
     """Factual attribution default from yt-dlp info.json fields only (no promo copy)."""
     login = (owner.get("uploader_id") or "").strip()
@@ -94,6 +120,13 @@ def main():
     parser.add_argument("--info-json", help="yt-dlp .info.json for --input files (owner check needs it)")
     parser.add_argument("--upscale", default=None, help="2160 (default) | 1440 | off; env CUTSCENECITY_UPSCALE")
     parser.add_argument("--profile", default=None, help="stream-layout profile name from editorial-policy.json")
+    parser.add_argument("--edit-style", default=None, choices=("off", "clean", "hype"),
+                        help="automatic edit stage: hype (default) | clean (captions only) | off; env CUTSCENECITY_EDIT_STYLE")
+    parser.add_argument("--caption-style", default=None, help="word caption highlight style from editorial-policy.json word_caption_styles")
+    parser.add_argument("--window", action="append", default=[], metavar="START-END",
+                        help="render this exact window (seconds in the input file) instead of auto-selection; repeatable")
+    parser.add_argument("--join-adjacent", action="store_true", help="join two adjacent picks into one clip (<= 60 s total)")
+    parser.add_argument("--flash-cut", action="store_true", help="white flash where a clip joins two adjacent picks (off by default)")
     args = parser.parse_args()
     if not 15 <= args.seconds <= 60:
         raise ValueError("--seconds must be 15-60")
@@ -134,7 +167,9 @@ def main():
     chat = signals.chat_times(args.chat) if args.chat else None
     transcript = signals.transcript_segments(args.transcript) if args.transcript else None
     rows = signals.score_windows(duration, samples, audio=audio, chat=chat, transcript=transcript, seconds=args.seconds)
-    selected = signals.select(rows, limit=args.limit, min_score=args.min_score)
+    selected = manual_windows(args.window, duration) if args.window else signals.select(rows, limit=args.limit, min_score=args.min_score)
+    if args.join_adjacent:
+        selected = join_adjacent(selected)
     source_url = args.url if not args.input else (f"https://www.twitch.tv/videos/{owner['vod_id']}" if owner.get("vod_id") else None)
     manifest = {"schema": "cutscenecity.review-manifest/2", "source": source_url or str(video), "duration_seconds": duration,
                 "selection_method": "weighted percentile ranks of " + ", ".join(selected[0]["signals_used"] if selected else ["motion"])
@@ -158,7 +193,9 @@ def main():
         if args.render:
             clip["render"] = render.render(video, row["start"], row["end"], out, name, captions=args.captions,
                                            layout=args.layout, crop_x=crop_x, facecam=facecam,
-                                           blur_regions=profile.get("blur_regions", []), upscale=args.upscale)
+                                           blur_regions=profile.get("blur_regions", []), upscale=args.upscale,
+                                           edit_style=args.edit_style, word_caption_style=args.caption_style,
+                                           joins=row.get("joins", []), flash_cut=args.flash_cut)
             clip["render"]["facecam"] = facecam
             clip["render"]["profile"] = args.profile
             clip["technical_qa"] = qa.validate(out / name, row["start"], row["end"])

@@ -19,6 +19,8 @@ import os
 import pathlib
 import subprocess
 
+import edit as edit_stage
+
 W, H = 1080, 1920
 LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"
 LAYOUTS = ("pad", "blur", "crop", "split")
@@ -276,9 +278,12 @@ def render(video, start, end, out_dir, out_name, captions=False, **opts):
         opts["crop_x"] = smart_crop_x(video, start, end)
     elif opts.get("crop_x") in (None, "smart"):
         opts["crop_x"] = 0.5
+    style = edit_stage.edit_style(opts.pop("edit_style", None))   # default hype; off = opt-out
+    joins, flash = list(opts.pop("joins", None) or []), bool(opts.pop("flash_cut", False))
+    word_style = opts.pop("word_caption_style", None)
     srt_name = None
     caption_status = "OFF"
-    if captions:
+    if captions and style == "off":   # clean/hype burn word-by-word captions in the edit stage instead
         srt_name = pathlib.Path(out_name).stem + ".srt"
         if transcribe(video, start, end, out_dir / srt_name):
             caption_status = "BURNED_IN_NEEDS_HUMAN_CHECK"
@@ -288,8 +293,13 @@ def render(video, start, end, out_dir, out_name, captions=False, **opts):
     cmd_opts = {k: v for k, v in opts.items() if k != "caption_style_name"}
     args = build_command(video, start, end, out_name, srt_name=srt_name, has_source_audio=has_audio(video), **cmd_opts)
     subprocess.run(args, check=True, cwd=str(out_dir), env={**os.environ})
-    up = upscale(out_dir / out_name, up_setting)
-    return {**up, "layout": opts.get("layout", "blur"), "crop_x": round(float(opts.get("crop_x", 0.5)), 3),
+    ed = edit_stage.apply(out_dir / out_name, style, joins=joins, flash=flash, word_style=word_style,
+                          energy_source=(video, start) if has_audio(video) else None)   # captions/effects
+    if ed.get("word_captions", "").startswith("BURNED"):
+        caption_status = ed["word_captions"]
+        opts["caption_style_name"] = ed["word_caption_style"]
+    up = upscale(out_dir / out_name, up_setting)                                                       # then upscale
+    return {**ed, **up, "layout": opts.get("layout", "blur"), "crop_x": round(float(opts.get("crop_x", 0.5)), 3),
             "audio_mode": opts.get("audio_mode", "source"), "commentary_mixed": bool(opts.get("commentary")),
             "mic_source": (f"file:{pathlib.Path(opts['mic']).name}" if opts.get("mic") else
                            (f"stream:{opts['mic_stream']}" if opts.get("mic_stream") is not None else None)),

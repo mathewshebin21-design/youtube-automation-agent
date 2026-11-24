@@ -104,6 +104,11 @@
     "yellow-pop": "FontName=Arial,FontSize=15,PrimaryColour=&H0000FFFF,Outline=3,MarginV=260",
     "clean-lower": "FontName=Helvetica,FontSize=12,Outline=1,Shadow=1,MarginV=180"
   },
+  "word_caption_styles": {
+    "word-pop-yellow": "&H00FFFF&",
+    "word-pop-cyan": "&HFFFF00&",
+    "word-pop-green": "&H00FF00&"
+  },
   "default_layout_profile": "cutscenecity-default",
   "layout_profiles": {
     "cutscenecity-default": {
